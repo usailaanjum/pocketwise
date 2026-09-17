@@ -4,6 +4,7 @@ import test from "node:test";
 import {
   calculateCategorySpending,
   createDefaultCategories,
+  hasCustomCategoryPlan,
   isBudgetCategory,
 } from "../lib/budget-categories.ts";
 
@@ -15,6 +16,12 @@ test("default category limits allocate the full user spending plan", () => {
   assert.ok(categories.every((category) => !category.custom));
 });
 
+test("recognizes whether saved category limits were customized", () => {
+  const defaults = createDefaultCategories(3200);
+  assert.equal(hasCustomCategoryPlan(defaults, 3200), false);
+  assert.equal(hasCustomCategoryPlan([{ ...defaults[0], limit: defaults[0].limit + 20 }, ...defaults.slice(1)], 3200), true);
+});
+
 test("category spending comes from expenses and sends unknown expenses to Other", () => {
   const categories = createDefaultCategories(3200);
   const spending = calculateCategorySpending(categories, [
@@ -22,6 +29,7 @@ test("category spending comes from expenses and sends unknown expenses to Other"
     { category: "Groceries", amount: -17.6 },
     { category: "Income", amount: 2400 },
     { category: "Unmapped category", amount: -25 },
+    { category: "Payments & transfers", amount: -400 },
   ]);
 
   assert.equal(spending.Groceries, 100);

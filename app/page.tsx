@@ -1,12 +1,16 @@
 "use client";
 
-import type { ChangeEvent, DragEvent, FormEvent, ReactNode } from "react";
+// This page keeps editable app data in React state. The storage helpers below
+// persist that snapshot separately from the original imported statement files.
+
+import type { ChangeEvent, DragEvent, FormEvent, ReactNode, RefObject } from "react";
 import { useEffect, useMemo, useRef, useState } from "react";
 
 import {
   calculateCategorySpending,
   createDefaultCategories,
   customCategoryColors,
+  hasCustomCategoryPlan,
   isBudgetCategory,
 } from "../lib/budget-categories";
 import type { BudgetCategory } from "../lib/budget-categories";
@@ -30,6 +34,9 @@ import type {
   SavingsGoal,
 } from "../lib/financial-tracker";
 import { parsePdfStatement, StatementPdfError } from "../lib/statement-parser";
+import { getStatementFile, listStatements, loadWorkspace, saveImportedStatement, saveWorkspace } from "../lib/local-database";
+import type { SavedStatement } from "../lib/local-database";
+import { availableMonths, localDateInput, monthLabel } from "../lib/calendar";
 
 type Tab = "Overview" | "Transactions" | "Categories" | "Plan" | "Reports";
 type Transaction = {
@@ -49,12 +56,22 @@ type Transaction = {
   sourceInstitution?: string;
   postingDate?: string;
   confidence?: number;
+  sourceStatementId?: string;
 };
 
 type BudgetSettings = {
   monthlyIncome: number;
   spendingLimit: number;
   currency: "CAD";
+};
+
+type WorkspaceSnapshot = {
+  settings: BudgetSettings;
+  transactions: Transaction[];
+  categories: BudgetCategory[];
+  accounts: FinancialAccount[];
+  goals: SavingsGoal[];
+  recurringItems: RecurringItem[];
 };
 
 type TransactionDraft = {
@@ -78,19 +95,18 @@ const storageKeys = {
   recurring: "pocketwise.recurring.v1",
 };
 
+// Read and validate legacy localStorage arrays during the IndexedDB migration.
+function legacyItems<T>(raw: string | null, isItem: (value: unknown) => value is T): T[] {
+  if (!raw) return [];
+  const parsed: unknown = JSON.parse(raw);
+  return Array.isArray(parsed) ? parsed.filter(isItem) : [];
+}
+
 const emptyTransactionDraft: TransactionDraft = { merchant: "", amount: "", category: "Groceries", note: "", date: "", kind: "expense" };
 const accountTypes: AccountType[] = ["Chequing", "Savings", "Cash", "Investment", "Credit card", "Line of credit", "Loan", "Mortgage", "Other"];
 const recurringFrequencies: RecurringFrequency[] = ["Weekly", "Every two weeks", "Monthly", "Yearly"];
 
-const initialTransactions: Transaction[] = [
-  { id: 1, merchant: "Metro Market", note: "Groceries", date: "Today, 10:24 AM", amount: -86.42, category: "Groceries", initials: "M", tone: "pink", monthKey: "August 2026" },
-  { id: 2, merchant: "Northline Energy", note: "Utilities", date: "Yesterday, 4:18 PM", amount: -124.8, category: "Utilities", initials: "N", tone: "blue", monthKey: "August 2026" },
-  { id: 3, merchant: "Alder & Co.", note: "Coffee & lunch", date: "Aug 16, 12:42 PM", amount: -18.75, category: "Dining", initials: "A", tone: "gold", monthKey: "August 2026" },
-  { id: 4, merchant: "Harborview Studio", note: "Monthly rent", date: "Aug 15, 9:00 AM", amount: -1850, category: "Housing", initials: "H", tone: "purple", monthKey: "August 2026" },
-  { id: 5, merchant: "Willow Freelance", note: "Invoice #1048", date: "Aug 14, 8:31 AM", amount: 2400, category: "Income", initials: "W", tone: "green", monthKey: "August 2026" },
-  { id: 6, merchant: "Fresh Basket", note: "Weekly shop", date: "Aug 13, 6:05 PM", amount: -64.2, category: "Groceries", initials: "F", tone: "mint", review: true, monthKey: "August 2026" },
-];
-
+// Render a shared line icon by name and size.
 function Icon({ name, size = 18 }: { name: string; size?: number }) {
   const common = { width: size, height: size, viewBox: "0 0 24 24", fill: "none", stroke: "currentColor", strokeWidth: 1.8, strokeLinecap: "round" as const, strokeLinejoin: "round" as const };
   const paths: Record<string, ReactNode> = {
@@ -114,10 +130,12 @@ function Icon({ name, size = 18 }: { name: string; size?: number }) {
   return <svg {...common} aria-hidden="true">{paths[name]}</svg>;
 }
 
+// Format an absolute amount as Canadian dollars for display.
 function money(value: number) {
   return new Intl.NumberFormat("en-CA", { style: "currency", currency: "CAD", maximumFractionDigits: 2 }).format(Math.abs(value));
 }
 
+// Turn a saved ISO date into a readable local statement date.
 function formatStatementDate(value: string) {
   const [year, month, day] = value.split("-").map(Number);
   if (!year || !month || !day) return value;
@@ -125,12 +143,32 @@ function formatStatementDate(value: string) {
     .format(new Date(year, month - 1, day));
 }
 
+// Convert a saved display date back into the value expected by a date input.
+function editableDate(value: string): string {
+  if (/^\d{4}-\d{2}-\d{2}$/.test(value)) return value;
+  const parsed = new Date(value);
+  return Number.isNaN(parsed.getTime()) ? "" : localDateInput(parsed);
+}
+
+// Match every search term against a transaction's name, note, and date formats.
+function matchesTransactionSearch(transaction: Transaction, query: string): boolean {
+  const terms = query.trim().toLowerCase().split(/\s+/).filter(Boolean);
+  if (!terms.length) return true;
+  const searchable = `${transaction.merchant} ${transaction.note} ${transaction.date} ${editableDate(transaction.date)}`.toLowerCase();
+  return terms.every((term) => searchable.includes(term));
+}
+
+// Own the local workspace state, data persistence, page navigation, and dialogs.
 export default function Home() {
   const [activeTab, setActiveTab] = useState<Tab>("Overview");
-  const [transactions, setTransactions] = useState(initialTransactions);
+  const [transactions, setTransactions] = useState<Transaction[]>([]);
   const [search, setSearch] = useState("");
+  const [quickSearch, setQuickSearch] = useState("");
+  const [searchOpen, setSearchOpen] = useState(false);
+  const [reviewOnly, setReviewOnly] = useState(false);
+  const [notificationsOpen, setNotificationsOpen] = useState(false);
   const [categoryFilter, setCategoryFilter] = useState("All categories");
-  const [month, setMonth] = useState("August 2026");
+  const [month, setMonth] = useState(() => monthLabel(new Date()));
   const [showModal, setShowModal] = useState(false);
   const [editingTransactionId, setEditingTransactionId] = useState<number | null>(null);
   const [showImport, setShowImport] = useState(false);
@@ -139,6 +177,9 @@ export default function Home() {
   const [importMessage, setImportMessage] = useState("");
   const [importWarnings, setImportWarnings] = useState<string[]>([]);
   const [pendingImport, setPendingImport] = useState<Transaction[]>([]);
+  const [pendingFile, setPendingFile] = useState<File | null>(null);
+  const [importSaving, setImportSaving] = useState(false);
+  const [savedStatements, setSavedStatements] = useState<SavedStatement[]>([]);
   const [importCounts, setImportCounts] = useState({ found: 0, review: 0, duplicates: 0 });
   const [settings, setSettings] = useState<BudgetSettings>(defaultSettings);
   const [budgetCategories, setBudgetCategories] = useState<BudgetCategory[]>(() => createDefaultCategories(defaultSettings.spendingLimit));
@@ -158,76 +199,138 @@ export default function Home() {
   const [plannerError, setPlannerError] = useState("");
   const [backupMessage, setBackupMessage] = useState("");
   const [storageReady, setStorageReady] = useState(false);
+  const [storageError, setStorageError] = useState("");
   const [form, setForm] = useState<TransactionDraft>(emptyTransactionDraft);
   const fileRef = useRef<HTMLInputElement>(null);
   const backupRef = useRef<HTMLInputElement>(null);
+  const searchRef = useRef<HTMLInputElement>(null);
+  const quickSearchRef = useRef<HTMLDivElement>(null);
+  const quickSearchInputRef = useRef<HTMLInputElement>(null);
+  const quickSearchButtonRef = useRef<HTMLButtonElement>(null);
+  const notificationRef = useRef<HTMLDivElement>(null);
+  const notificationButtonRef = useRef<HTMLButtonElement>(null);
+  const importRequestRef = useRef(0);
   const categoriesCustomizedRef = useRef(false);
 
+  // Hydrate the workspace before allowing edits, so initial empty state cannot overwrite saved data.
   useEffect(() => {
-    const hydrationTimer = window.setTimeout(() => {
+    let cancelled = false;
+    // Load IndexedDB data, migrating any earlier localStorage workspace once.
+    async function initializeStorage() {
       try {
-        const savedSettings = window.localStorage.getItem(storageKeys.settings);
-        const savedTransactions = window.localStorage.getItem(storageKeys.transactions);
-        const savedCategories = window.localStorage.getItem(storageKeys.categories);
-        const savedAccounts = window.localStorage.getItem(storageKeys.accounts);
-        const savedGoals = window.localStorage.getItem(storageKeys.goals);
-        const savedRecurring = window.localStorage.getItem(storageKeys.recurring);
-        let categoryLimit = defaultSettings.spendingLimit;
-        if (savedSettings) {
-          const parsedSettings = JSON.parse(savedSettings) as BudgetSettings;
-          setSettings(parsedSettings);
-          categoryLimit = parsedSettings.spendingLimit;
-          setBudgetDraft({ monthlyIncome: String(parsedSettings.monthlyIncome), spendingLimit: String(parsedSettings.spendingLimit) });
+        let saved = await loadWorkspace<WorkspaceSnapshot>();
+        if (!saved) {
+          const legacy = {
+            settings: window.localStorage.getItem(storageKeys.settings),
+            transactions: window.localStorage.getItem(storageKeys.transactions),
+            categories: window.localStorage.getItem(storageKeys.categories),
+            accounts: window.localStorage.getItem(storageKeys.accounts),
+            goals: window.localStorage.getItem(storageKeys.goals),
+            recurringItems: window.localStorage.getItem(storageKeys.recurring),
+          };
+          if (Object.values(legacy).some(Boolean)) {
+            const legacySettings = legacy.settings ? JSON.parse(legacy.settings) as BudgetSettings : defaultSettings;
+            const legacyCategories = legacyItems(legacy.categories, isBudgetCategory);
+            saved = {
+              settings: legacySettings,
+              transactions: legacy.transactions ? JSON.parse(legacy.transactions) as Transaction[] : [],
+              categories: legacyCategories.length
+                ? legacyCategories
+                : createDefaultCategories(legacySettings.spendingLimit),
+              accounts: legacyItems(legacy.accounts, isFinancialAccount),
+              goals: legacyItems(legacy.goals, isSavingsGoal),
+              recurringItems: legacyItems(legacy.recurringItems, isRecurringItem),
+            };
+            await saveWorkspace(saved);
+          }
+        }
+        const statements = await listStatements();
+        if (cancelled) return;
+        if (saved) {
+          setSettings(saved.settings);
+          setTransactions(saved.transactions);
+          setBudgetCategories(saved.categories);
+          setAccounts(saved.accounts);
+          setGoals(saved.goals);
+          setRecurringItems(saved.recurringItems);
+          setBudgetDraft({ monthlyIncome: String(saved.settings.monthlyIncome), spendingLimit: String(saved.settings.spendingLimit) });
+          categoriesCustomizedRef.current = hasCustomCategoryPlan(saved.categories, saved.settings.spendingLimit);
         } else {
           setShowBudgetSetup(true);
           setBudgetSetupRequired(true);
         }
-        if (savedTransactions) setTransactions(JSON.parse(savedTransactions) as Transaction[]);
-        if (savedCategories) {
-          const parsedCategories = JSON.parse(savedCategories) as unknown;
-          const validCategories = Array.isArray(parsedCategories) ? parsedCategories.filter(isBudgetCategory) : [];
-          setBudgetCategories(validCategories.length ? validCategories : createDefaultCategories(categoryLimit));
-          categoriesCustomizedRef.current = validCategories.length > 0;
-        } else {
-          setBudgetCategories(createDefaultCategories(categoryLimit));
-          categoriesCustomizedRef.current = false;
-        }
-        if (savedAccounts) {
-          const parsed = JSON.parse(savedAccounts) as unknown;
-          if (Array.isArray(parsed)) setAccounts(parsed.filter(isFinancialAccount));
-        }
-        if (savedGoals) {
-          const parsed = JSON.parse(savedGoals) as unknown;
-          if (Array.isArray(parsed)) setGoals(parsed.filter(isSavingsGoal));
-        }
-        if (savedRecurring) {
-          const parsed = JSON.parse(savedRecurring) as unknown;
-          if (Array.isArray(parsed)) setRecurringItems(parsed.filter(isRecurringItem));
-        }
-      } catch {
-        setShowBudgetSetup(true);
-        setBudgetSetupRequired(true);
-      } finally {
+        setSavedStatements(statements);
         setStorageReady(true);
+      } catch (error) {
+        if (!cancelled) setStorageError(error instanceof Error ? error.message : "Browser storage is unavailable.");
       }
-    }, 0);
-    return () => window.clearTimeout(hydrationTimer);
+    }
+    void initializeStorage();
+    return () => { cancelled = true; };
   }, []);
 
+  // Persist every workspace edit in order once hydration has completed.
   useEffect(() => {
     if (!storageReady) return;
-    window.localStorage.setItem(storageKeys.settings, JSON.stringify(settings));
-    window.localStorage.setItem(storageKeys.transactions, JSON.stringify(transactions));
-    window.localStorage.setItem(storageKeys.categories, JSON.stringify(budgetCategories));
-    window.localStorage.setItem(storageKeys.accounts, JSON.stringify(accounts));
-    window.localStorage.setItem(storageKeys.goals, JSON.stringify(goals));
-    window.localStorage.setItem(storageKeys.recurring, JSON.stringify(recurringItems));
+    void saveWorkspace({ settings, transactions, categories: budgetCategories, accounts, goals, recurringItems })
+      .then(() => setStorageError(""))
+      .catch((error) => setStorageError(error instanceof Error ? error.message : "Browser storage could not save this change."));
   }, [settings, transactions, budgetCategories, accounts, goals, recurringItems, storageReady]);
 
+  // Let users dismiss notifications without changing the current page.
+  useEffect(() => {
+    if (!notificationsOpen) return;
+    // Dismiss the open header panel when a pointer press happens outside it.
+    function closeOnOutsideClick(event: PointerEvent) {
+      if (!notificationRef.current?.contains(event.target as Node)) setNotificationsOpen(false);
+    }
+    // Close the open header panel on Escape and return focus to its button.
+    function closeOnEscape(event: KeyboardEvent) {
+      if (event.key === "Escape") {
+        setNotificationsOpen(false);
+        notificationButtonRef.current?.focus();
+      }
+    }
+    document.addEventListener("pointerdown", closeOnOutsideClick);
+    document.addEventListener("keydown", closeOnEscape);
+    return () => {
+      document.removeEventListener("pointerdown", closeOnOutsideClick);
+      document.removeEventListener("keydown", closeOnEscape);
+    };
+  }, [notificationsOpen]);
+
+  // Search stays in a header popover and only opens an editor when a result is chosen.
+  useEffect(() => {
+    if (!searchOpen) return;
+    quickSearchInputRef.current?.focus();
+    // Dismiss the open header panel when a pointer press happens outside it.
+    function closeOnOutsideClick(event: PointerEvent) {
+      if (!quickSearchRef.current?.contains(event.target as Node)) setSearchOpen(false);
+    }
+    // Close the open header panel on Escape and return focus to its button.
+    function closeOnEscape(event: KeyboardEvent) {
+      if (event.key === "Escape") {
+        setSearchOpen(false);
+        quickSearchButtonRef.current?.focus();
+      }
+    }
+    document.addEventListener("pointerdown", closeOnOutsideClick);
+    document.addEventListener("keydown", closeOnEscape);
+    return () => {
+      document.removeEventListener("pointerdown", closeOnOutsideClick);
+      document.removeEventListener("keydown", closeOnEscape);
+    };
+  }, [searchOpen]);
+
+  // The Transactions page uses the same name and date matcher as header search.
   const filteredTransactions = useMemo(() => transactions.filter((transaction) => {
-    const matchesSearch = `${transaction.merchant} ${transaction.note}`.toLowerCase().includes(search.toLowerCase());
-    return matchesSearch && (categoryFilter === "All categories" || transaction.category === categoryFilter);
-  }), [transactions, search, categoryFilter]);
+    const matchesSearch = matchesTransactionSearch(transaction, search);
+    return matchesSearch && (categoryFilter === "All categories" || transaction.category === categoryFilter) && (!reviewOnly || transaction.review);
+  }), [transactions, search, categoryFilter, reviewOnly]);
+
+  const quickSearchResults = useMemo(() => quickSearch.trim()
+    ? transactions.filter((transaction) => matchesTransactionSearch(transaction, quickSearch))
+    : [], [transactions, quickSearch]);
 
   const categoryOptions = useMemo(() => {
     const names = new Set(budgetCategories.map((category) => category.name));
@@ -237,12 +340,14 @@ export default function Home() {
     return Array.from(names);
   }, [budgetCategories, transactions]);
 
+  // Prepare a blank transaction form with today's local date.
   function openAddTransaction() {
     setEditingTransactionId(null);
-    setForm({ ...emptyTransactionDraft, date: new Date().toISOString().slice(0, 10) });
+    setForm({ ...emptyTransactionDraft, date: localDateInput(new Date()) });
     setShowModal(true);
   }
 
+  // Fill the transaction form from an existing row.
   function openEditTransaction(transaction: Transaction) {
     setEditingTransactionId(transaction.id);
     setForm({
@@ -250,33 +355,35 @@ export default function Home() {
       amount: String(Math.abs(transaction.amount)),
       category: transaction.category,
       note: transaction.note,
-      date: transaction.date,
+      date: editableDate(transaction.date),
       kind: transaction.amount >= 0 ? "income" : "expense",
     });
     setShowModal(true);
   }
 
+  // Validate and save a manual or edited transaction, then update its month.
   function saveTransaction(event: FormEvent) {
     event.preventDefault();
     if (!form.merchant || !form.amount) return;
     const magnitude = Math.abs(Number(form.amount));
     if (!Number.isFinite(magnitude) || magnitude === 0) return;
     const amount = form.kind === "income" ? magnitude : -magnitude;
-    const parsedDate = new Date(form.date);
-    const monthKey = Number.isNaN(parsedDate.getTime())
-      ? month
-      : new Intl.DateTimeFormat("en-CA", { month: "long", year: "numeric" }).format(parsedDate);
+    const parsedDate = /^\d{4}-\d{2}-\d{2}$/.test(form.date)
+      ? new Date(`${form.date}T12:00:00`)
+      : new Date(form.date);
+    const monthKey = Number.isNaN(parsedDate.getTime()) ? month : monthLabel(parsedDate);
     if (editingTransactionId !== null) {
       setTransactions((current) => current.map((transaction) => transaction.id === editingTransactionId
         ? {
           ...transaction,
           merchant: form.merchant.trim(),
           note: form.note.trim() || "Manual entry",
-          date: form.date || transaction.date,
+          date: form.date ? formatStatementDate(form.date) : transaction.date,
           amount,
           category: form.category,
           initials: form.merchant.trim().slice(0, 1).toUpperCase(),
-          monthKey,
+          monthKey: form.date ? monthKey : transaction.monthKey ?? month,
+          postingDate: form.date && formatStatementDate(form.date) !== transaction.date ? undefined : transaction.postingDate,
           review: false,
         }
         : transaction));
@@ -294,10 +401,12 @@ export default function Home() {
       }, ...current]);
     }
     setForm(emptyTransactionDraft);
+    if (editingTransactionId === null) setMonth(monthKey);
     setEditingTransactionId(null);
     setShowModal(false);
   }
 
+  // Confirm deletion before removing a transaction from the workspace.
   function deleteTransaction() {
     if (editingTransactionId === null) return;
     const transaction = transactions.find((item) => item.id === editingTransactionId);
@@ -307,6 +416,7 @@ export default function Home() {
     setShowModal(false);
   }
 
+  // Suggest a category for CSV rows from the merchant name.
   function inferCategory(merchant: string) {
     const value = merchant.toLowerCase();
     if (value.includes("rent") || value.includes("housing") || value.includes("studio")) return "Housing";
@@ -320,6 +430,7 @@ export default function Home() {
     return "Other";
   }
 
+  // Split one CSV row while respecting quoted commas and escaped quotes.
   function parseCsvRow(row: string) {
     const cells: string[] = [];
     let cell = "";
@@ -335,6 +446,7 @@ export default function Home() {
     return cells;
   }
 
+  // Reset the import preview and open the statement dialog.
   function openImport() {
     setPendingImport([]);
     setImportCounts({ found: 0, review: 0, duplicates: 0 });
@@ -343,6 +455,7 @@ export default function Home() {
     setShowImport(true);
   }
 
+  // Save budget baselines and refresh untouched default category limits.
   function saveBudget(event: FormEvent) {
     event.preventDefault();
     const monthlyIncome = Number(budgetDraft.monthlyIncome);
@@ -354,6 +467,7 @@ export default function Home() {
     setShowBudgetSetup(false);
   }
 
+  // Prepare the form and color for a new custom category.
   function openAddCategory() {
     const customCount = budgetCategories.filter((category) => category.custom).length;
     setCategoryDraft({
@@ -366,6 +480,7 @@ export default function Home() {
     setCategoryEditorMode("add");
   }
 
+  // Load an existing category into the limit editor.
   function openEditCategory(category: BudgetCategory) {
     setCategoryDraft({ name: category.name, limit: String(category.limit), color: category.color });
     setEditingCategoryId(category.id);
@@ -373,12 +488,14 @@ export default function Home() {
     setCategoryEditorMode("edit");
   }
 
+  // Clear category editing state and validation errors.
   function closeCategoryEditor() {
     setCategoryEditorMode(null);
     setEditingCategoryId(null);
     setCategoryError("");
   }
 
+  // Validate a category, update its limit, and rename linked transactions if needed.
   function saveCategory(event: FormEvent) {
     event.preventDefault();
     const name = categoryDraft.name.trim().replace(/\s+/g, " ");
@@ -430,12 +547,14 @@ export default function Home() {
     closeCategoryEditor();
   }
 
+  // Clear the account, goal, or recurring item editor.
   function closePlannerEditor() {
     setPlannerEditor(null);
     setPlannerEditingId(null);
     setPlannerError("");
   }
 
+  // Open the account form for a new or existing balance.
   function openAccountEditor(account?: FinancialAccount) {
     setPlannerEditingId(account?.id ?? null);
     setAccountDraft(account
@@ -445,6 +564,7 @@ export default function Home() {
     setPlannerEditor("account");
   }
 
+  // Open the savings goal form with current values when editing.
   function openGoalEditor(goal?: SavingsGoal) {
     setPlannerEditingId(goal?.id ?? null);
     setGoalDraft(goal
@@ -454,6 +574,7 @@ export default function Home() {
     setPlannerEditor("goal");
   }
 
+  // Open the recurring item form with current values when editing.
   function openRecurringEditor(item?: RecurringItem) {
     setPlannerEditingId(item?.id ?? null);
     setRecurringDraft(item
@@ -463,6 +584,7 @@ export default function Home() {
     setPlannerEditor("recurring");
   }
 
+  // Validate and save an asset or liability balance.
   function saveAccount(event: FormEvent) {
     event.preventDefault();
     const name = accountDraft.name.trim();
@@ -484,6 +606,7 @@ export default function Home() {
     closePlannerEditor();
   }
 
+  // Validate and save a savings target and progress amount.
   function saveGoal(event: FormEvent) {
     event.preventDefault();
     const name = goalDraft.name.trim();
@@ -506,6 +629,7 @@ export default function Home() {
     closePlannerEditor();
   }
 
+  // Validate and save a recurring payment or income item.
   function saveRecurring(event: FormEvent) {
     event.preventDefault();
     const name = recurringDraft.name.trim();
@@ -528,6 +652,7 @@ export default function Home() {
     closePlannerEditor();
   }
 
+  // Confirm and remove the planner item currently being edited.
   function deletePlannerItem() {
     if (!plannerEditingId || !plannerEditor) return;
     const labels = { account: "account", goal: "goal", recurring: "recurring item" } as const;
@@ -538,6 +663,7 @@ export default function Home() {
     closePlannerEditor();
   }
 
+  // Create a browser download for generated CSV or JSON content.
   function downloadLocalFile(filename: string, contents: string, type: string) {
     const url = URL.createObjectURL(new Blob([contents], { type }));
     const link = document.createElement("a");
@@ -547,6 +673,23 @@ export default function Home() {
     URL.revokeObjectURL(url);
   }
 
+  // Retrieve and download an untouched original statement from IndexedDB.
+  async function downloadStatement(statement: SavedStatement) {
+    try {
+      const file = await getStatementFile(statement.id);
+      if (!file) throw new Error("The original file could not be found in this browser.");
+      const url = URL.createObjectURL(file);
+      const link = document.createElement("a");
+      link.href = url;
+      link.download = statement.name;
+      link.click();
+      window.setTimeout(() => URL.revokeObjectURL(url), 1000);
+    } catch (error) {
+      setBackupMessage(error instanceof Error ? error.message : "The original file could not be downloaded.");
+    }
+  }
+
+  // Export the selected transactions and their source details as CSV.
   function exportTransactions(items = transactions) {
     const escapeCsv = (value: string | number | undefined) => `"${String(value ?? "").replaceAll('"', '""')}"`;
     const headers = ["Date", "Merchant", "Note", "Category", "Amount CAD", "Original amount", "Original currency", "Institution"];
@@ -563,6 +706,7 @@ export default function Home() {
     downloadLocalFile("pocketwise-transactions.csv", [headers.map(escapeCsv).join(","), ...rows].join("\n"), "text/csv;charset=utf-8");
   }
 
+  // Export the selected month's calculated financial summary as CSV.
   function exportReport() {
     const health = calculateFinancialHealth({
       monthlyIncome: settings.monthlyIncome,
@@ -585,6 +729,7 @@ export default function Home() {
     downloadLocalFile(`pocketwise-report-${month.toLowerCase().replaceAll(" ", "-")}.csv`, rows.map((row) => row.map((cell) => `"${cell}"`).join(",")).join("\n"), "text/csv;charset=utf-8");
   }
 
+  // Download editable app data as a JSON backup; originals stay separate.
   function downloadBackup() {
     const backup = {
       format: "pocketwise-local-backup",
@@ -601,10 +746,11 @@ export default function Home() {
     setBackupMessage("Backup downloaded. Keep the JSON file somewhere private.");
   }
 
+  // Validate a JSON backup before replacing editable workspace data.
   async function restoreBackup(file: File) {
     setBackupMessage("");
     try {
-      if (file.size > 5 * 1024 * 1024) throw new Error("Backup files must be smaller than 5 MB.");
+      if (file.size > 50 * 1024 * 1024) throw new Error("Backup files must be smaller than 50 MB.");
       const backup = JSON.parse(await file.text()) as Record<string, unknown>;
       const nextSettings = backup.settings as Partial<BudgetSettings> | undefined;
       const nextTransactions = backup.transactions;
@@ -612,6 +758,7 @@ export default function Home() {
       const nextAccounts = backup.accounts;
       const nextGoals = backup.goals;
       const nextRecurring = backup.recurringItems;
+      // A backup is external input even when it was originally created by this app.
       const validTransaction = (value: unknown): value is Transaction => {
         if (!value || typeof value !== "object") return false;
         const candidate = value as Partial<Transaction>;
@@ -634,8 +781,9 @@ export default function Home() {
         || !Array.isArray(nextRecurring) || !nextRecurring.every(isRecurringItem)) {
         throw new Error("That file is not a valid Pocketwise backup.");
       }
-      if (!window.confirm("Restore this backup and replace the data currently stored in this browser?")) return;
+      if (!window.confirm("Restore this backup and replace current app data? Saved original statement files will remain in this browser.")) return;
       const restoredSettings = nextSettings as BudgetSettings;
+      await saveWorkspace({ settings: restoredSettings, transactions: nextTransactions, categories: nextCategories, accounts: nextAccounts, goals: nextGoals, recurringItems: nextRecurring });
       setSettings(restoredSettings);
       setBudgetDraft({ monthlyIncome: String(restoredSettings.monthlyIncome), spendingLimit: String(restoredSettings.spendingLimit) });
       setTransactions(nextTransactions);
@@ -643,7 +791,7 @@ export default function Home() {
       setAccounts(nextAccounts);
       setGoals(nextGoals);
       setRecurringItems(nextRecurring);
-      categoriesCustomizedRef.current = true;
+      categoriesCustomizedRef.current = hasCustomCategoryPlan(nextCategories, restoredSettings.spendingLimit);
       setBudgetSetupRequired(false);
       setBackupMessage("Backup restored successfully.");
     } catch (error) {
@@ -651,12 +799,15 @@ export default function Home() {
     }
   }
 
+  // Parse a CSV or PDF locally and preview unique rows before saving.
   async function handleFile(file: File) {
+    const requestId = ++importRequestRef.current;
     const lowerName = file.name.toLowerCase();
     const isCsv = lowerName.endsWith(".csv");
     const isPdf = lowerName.endsWith(".pdf");
     setShowImport(true);
     setPendingImport([]);
+    setPendingFile(null);
     setImportCounts({ found: 0, review: 0, duplicates: 0 });
     setImportWarnings([]);
     setImportMessage(`Reading ${file.name} locally…`);
@@ -671,39 +822,49 @@ export default function Home() {
     }
 
     try {
+      // CSV column names must identify dates, descriptions, and money before rows are accepted.
       if (isCsv) {
         const rows = (await file.text()).split(/\r?\n/).map((row) => row.trim()).filter(Boolean);
+        if (requestId !== importRequestRef.current) return;
         const headers = parseCsvRow(rows[0] || "").map((header) => header.toLowerCase());
         const indexOf = (...names: string[]) => headers.findIndex((header) => names.some((name) => header.includes(name)));
         const dateIndex = indexOf("transaction date", "date");
         const merchantIndex = indexOf("description", "merchant", "payee", "activity");
-        const amountIndex = indexOf("amount", "cad amount");
+        const amountIndex = headers.findIndex((header) => header.includes("amount") && !/(original|foreign|exchange)/.test(header));
         const debitIndex = indexOf("debit");
         const creditIndex = indexOf("credit");
         const originalAmountIndex = indexOf("original amount", "foreign amount");
         const originalCurrencyIndex = indexOf("original currency", "foreign currency", "currency");
         const exchangeRateIndex = indexOf("exchange rate", "fx rate");
+        if (dateIndex < 0 || merchantIndex < 0 || (amountIndex < 0 && debitIndex < 0 && creditIndex < 0)) {
+          setImportMessage(`${file.name} · CSV needs date, description, and amount or debit/credit columns.`);
+          return;
+        }
         const parsed = rows.slice(1).map((row, index) => {
           const columns = parseCsvRow(row);
           const merchant = columns[merchantIndex] || columns[1] || columns[0] || `Imported item ${index + 1}`;
           const debit = Number((columns[debitIndex] || "0").replace(/[$,]/g, ""));
           const credit = Number((columns[creditIndex] || "0").replace(/[$,]/g, ""));
-          const rawAmount = Number((columns[amountIndex] || columns[2] || "0").replace(/[$,]/g, ""));
+          const rawAmount = Number((columns[amountIndex] || "0").replace(/[$,]/g, ""));
           const amount = debit ? -Math.abs(debit) : credit ? Math.abs(credit) : rawAmount;
           const originalAmount = Number((columns[originalAmountIndex] || "0").replace(/[$,]/g, "")) || undefined;
           const originalCurrency = columns[originalCurrencyIndex]?.toUpperCase() || undefined;
           const exchangeRate = Number(columns[exchangeRateIndex] || "0") || undefined;
           const date = columns[dateIndex] || columns[0] || "Imported";
-          const parsedDate = new Date(date);
-          const monthKey = Number.isNaN(parsedDate.getTime()) ? month : new Intl.DateTimeFormat("en-CA", { month: "long", year: "numeric" }).format(parsedDate);
+          const parsedDate = /^\d{4}-\d{2}-\d{2}$/.test(date) ? new Date(`${date}T12:00:00`) : new Date(date);
+          const monthKey = Number.isNaN(parsedDate.getTime()) ? month : monthLabel(parsedDate);
           const category = inferCategory(merchant);
           return { id: Date.now() + index, merchant, note: "Imported from CSV", date, amount, category, initials: merchant.slice(0, 1).toUpperCase(), tone: "mint", originalAmount, originalCurrency, exchangeRate, monthKey, review: category === "Other" };
         }).filter((item) => item.amount !== 0);
         const { unique, duplicateCount } = excludeExistingTransactions(transactions, parsed);
         const review = unique.filter((item) => item.review).length;
         setPendingImport(unique);
+        setPendingFile(parsed.length ? file : null);
         setImportCounts({ found: unique.length, review, duplicates: duplicateCount });
-        setImportMessage(`${file.name} · ${unique.length} new line items ready to review`);
+        setImportMessage(unique.length
+          ? `${file.name} · ${unique.length} new line items ready to review`
+          : duplicateCount ? `${file.name} · transactions already added; you can still save the original`
+            : `${file.name} · no transaction rows found`);
         const warnings: string[] = [];
         if (!parsed.length) warnings.push("No non-zero transaction rows were found. Check the CSV column names.");
         if (duplicateCount) warnings.push(`${duplicateCount} matching ${duplicateCount === 1 ? "transaction was" : "transactions were"} already in Pocketwise and skipped.`);
@@ -711,7 +872,9 @@ export default function Home() {
         return;
       }
 
+      // PDF parsing uses institution and column clues instead of the uploaded filename.
       const result = await parsePdfStatement(file);
+      if (requestId !== importRequestRef.current) return;
       const imported: Transaction[] = result.transactions.map((transaction, index) => {
         const review = result.institutionId === "unknown" || transaction.confidence < 0.85 || transaction.category === "Other";
         return {
@@ -736,6 +899,7 @@ export default function Home() {
       const { unique, duplicateCount } = excludeExistingTransactions(transactions, imported);
       const review = unique.filter((transaction) => transaction.review).length;
       setPendingImport(unique);
+      setPendingFile(imported.length ? file : null);
       setImportCounts({ found: unique.length, review, duplicates: duplicateCount });
       setImportWarnings([
         ...result.warnings,
@@ -743,10 +907,13 @@ export default function Home() {
       ]);
       setImportMessage(unique.length
         ? `${file.name} · ${result.institutionName} · ${unique.length} new line items found`
-        : `${file.name} · no transaction rows recognized`);
+        : duplicateCount ? `${file.name} · transactions already added; you can still save the original`
+          : `${file.name} · no transaction rows recognized`);
       if (result.statementMonth) setMonth(result.statementMonth);
     } catch (error) {
+      if (requestId !== importRequestRef.current) return;
       setPendingImport([]);
+      setPendingFile(null);
       setImportCounts({ found: 0, review: 0, duplicates: 0 });
       const message = error instanceof StatementPdfError
         ? error.message
@@ -755,6 +922,38 @@ export default function Home() {
     }
   }
 
+  // Atomically store the original file and add its unique transactions.
+  async function confirmImport() {
+    if (!pendingFile || importSaving || !storageReady) return;
+    setImportSaving(true);
+    const statement: SavedStatement = {
+      id: crypto.randomUUID(),
+      name: pendingFile.name,
+      type: pendingFile.type || (pendingFile.name.toLowerCase().endsWith(".pdf") ? "application/pdf" : "text/csv"),
+      size: pendingFile.size,
+      importedAt: new Date().toISOString(),
+      transactionCount: pendingImport.length,
+    };
+    const nextTransactions = [...pendingImport.map((item) => ({ ...item, sourceStatementId: statement.id })), ...transactions];
+    try {
+      await saveImportedStatement(pendingFile, statement, {
+        settings, transactions: nextTransactions, categories: budgetCategories, accounts, goals, recurringItems,
+      } satisfies WorkspaceSnapshot);
+      setTransactions(nextTransactions);
+      setSavedStatements((current) => [statement, ...current]);
+      setPendingFile(null);
+      setPendingImport([]);
+      setActiveTab("Transactions");
+      setShowImport(false);
+      setStorageError("");
+    } catch (error) {
+      setImportMessage(error instanceof Error ? `Could not save the statement: ${error.message}` : "Could not save the statement in this browser.");
+    } finally {
+      setImportSaving(false);
+    }
+  }
+
+  // Pass a chosen statement file into the shared import flow.
   function chooseFile(event: ChangeEvent<HTMLInputElement>) {
     const file = event.target.files?.[0];
     if (!file) return;
@@ -762,6 +961,7 @@ export default function Home() {
     event.target.value = "";
   }
 
+  // Pass a dropped statement file into the shared import flow.
   function dropFile(event: DragEvent<HTMLDivElement>) {
     event.preventDefault();
     const file = event.dataTransfer.files?.[0];
@@ -772,57 +972,93 @@ export default function Home() {
     { label: "Overview", icon: "grid" }, { label: "Transactions", icon: "card" }, { label: "Categories", icon: "tag" }, { label: "Plan", icon: "target" }, { label: "Reports", icon: "chart" },
   ];
   const monthTransactions = transactions.filter((transaction) => !transaction.monthKey || transaction.monthKey === month);
+  const monthOptions = availableMonths(new Date(), month, transactions.map((transaction) => transaction.monthKey));
+  const reviewCount = transactions.filter((transaction) => transaction.review).length;
   const financialHealth = calculateFinancialHealth({ monthlyIncome: settings.monthlyIncome, spendingLimit: settings.spendingLimit, transactions: monthTransactions, accounts });
   const monthRemaining = settings.spendingLimit - financialHealth.monthlyExpenses;
+  const monthlyPulse = monthTransactions.length ? `${financialHealth.status} monthly pulse.` : `No activity in ${month} yet.`;
   const activeEditingCategory = editingCategoryId
     ? budgetCategories.find((category) => category.id === editingCategoryId)
     : undefined;
 
   return (
-    <main className="app-shell">
+    <>
+    <main className="app-shell" inert={!storageReady} aria-busy={!storageReady}>
       <aside className="sidebar">
-        <div className="brand"><span className="brand-mark">↗</span><span>pocketwise</span></div>
+        <button className="brand" type="button" aria-label="Pocketwise — go to Overview" onClick={() => setActiveTab("Overview")}><span className="brand-mark">↗</span><span>pocketwise</span></button>
         <div className="workspace-label">PERSONAL SPACE</div>
         <nav className="main-nav" aria-label="Main navigation">
-          {navItems.map((item) => <button key={item.label} className={`nav-item ${activeTab === item.label ? "active" : ""}`} onClick={() => setActiveTab(item.label)}><Icon name={item.icon} size={17} /><span>{item.label}</span>{item.label === "Transactions" && <span className="nav-count">{transactions.length}</span>}</button>)}
+          {navItems.map((item) => <button key={item.label} className={`nav-item ${activeTab === item.label ? "active" : ""}`} type="button" aria-label={item.label} aria-current={activeTab === item.label ? "page" : undefined} onClick={() => setActiveTab(item.label)}><Icon name={item.icon} size={17} /><span>{item.label}</span>{item.label === "Transactions" && <span className="nav-count">{transactions.length}</span>}</button>)}
         </nav>
         <div className="sidebar-bottom">
-          <div className="tip-card"><div className="tip-spark">✦</div><p><strong>{financialHealth.status} monthly pulse.</strong><br />{monthRemaining >= 0 ? `${money(monthRemaining)} remains in your spending plan.` : `${money(monthRemaining)} over your spending plan.`}</p><button onClick={() => setActiveTab("Reports")}>View insights <Icon name="arrow" size={14} /></button></div>
-          <button className="nav-item" onClick={() => { setBudgetSetupRequired(false); setBackupMessage(""); setBudgetDraft({ monthlyIncome: String(settings.monthlyIncome), spendingLimit: String(settings.spendingLimit) }); setShowBudgetSetup(true); }}><Icon name="settings" size={17} /><span>Settings & backup</span></button>
-          <div className="profile"><div className="avatar">JS</div><div><strong>Jamie Smith</strong><span>Personal account</span></div><Icon name="more" size={17} /></div>
+          <div className="tip-card"><div className="tip-spark">✦</div><p><strong>{monthlyPulse}</strong><br />{monthTransactions.length ? monthRemaining >= 0 ? `${money(monthRemaining)} remains in your spending plan.` : `${money(monthRemaining)} over your spending plan.` : "Add or import transactions to see your monthly picture."}</p><button onClick={() => setActiveTab("Reports")}>View insights <Icon name="arrow" size={14} /></button></div>
+          <button className="nav-item" type="button" aria-label="Settings and backup" onClick={() => { setBudgetSetupRequired(false); setBackupMessage(""); setBudgetDraft({ monthlyIncome: String(settings.monthlyIncome), spendingLimit: String(settings.spendingLimit) }); setShowBudgetSetup(true); }}><Icon name="settings" size={17} /><span>Settings & backup</span></button>
+          <div className="profile"><div className="avatar">⌂</div><div><strong>Local workspace</strong><span>Saved in this browser</span></div></div>
         </div>
       </aside>
 
       <section className="content-area">
-        <header className="topbar"><div className="breadcrumb">Personal space <span>/</span> <strong>{activeTab}</strong></div><div className="top-actions"><button className="icon-button" aria-label="Search"><Icon name="search" size={18} /></button><button className="icon-button notification" aria-label="Notifications"><Icon name="bell" size={18} /><i /></button><div className="top-avatar">JS</div></div></header>
+        <header className="topbar">
+          <nav className="breadcrumb" aria-label="Breadcrumb"><button type="button" onClick={() => setActiveTab("Overview")}>Personal space</button><span aria-hidden="true">/</span><strong aria-current="page">{activeTab}</strong></nav>
+          <div className="top-actions">
+            <div className="quick-search-wrap" ref={quickSearchRef}>
+              <button ref={quickSearchButtonRef} className="icon-button" type="button" aria-label="Search transactions" aria-expanded={searchOpen} aria-controls="quick-search-panel" onClick={() => { setQuickSearch(""); setNotificationsOpen(false); setSearchOpen((open) => !open); }}><Icon name="search" size={18} /></button>
+              {searchOpen && <div className="quick-search-panel" id="quick-search-panel" aria-label="Search transactions">
+                <div className="quick-search-heading"><strong>Find a transaction</strong><span>Search all dates</span></div>
+                <form role="search" onSubmit={(event) => { event.preventDefault(); if (quickSearchResults[0]) { openEditTransaction(quickSearchResults[0]); setSearchOpen(false); } }}>
+                  <Icon name="search" size={17} />
+                  <input ref={quickSearchInputRef} value={quickSearch} onChange={(event) => setQuickSearch(event.target.value)} aria-label="Search by merchant, name, or date" placeholder="Merchant, name, or date" autoComplete="off" />
+                </form>
+                <div className="quick-search-results">
+                  {!quickSearch.trim() && <p className="quick-search-empty">Type a merchant, name, or date to search your saved transactions.</p>}
+                  {quickSearch.trim() && !quickSearchResults.length && <p className="quick-search-empty">No transactions found for “{quickSearch.trim()}”.</p>}
+                  {quickSearchResults.slice(0, 8).map((transaction) => <button className="quick-search-result" type="button" key={transaction.id} onClick={() => { openEditTransaction(transaction); setSearchOpen(false); }}><span><strong>{transaction.merchant}</strong><small>{transaction.date} · {transaction.category}</small></span><b>{transaction.amount < 0 ? "−" : "+"}{money(transaction.amount)}</b></button>)}
+                </div>
+                {quickSearchResults.length > 8 && <button className="quick-search-all" type="button" onClick={() => { setSearch(quickSearch.trim()); setCategoryFilter("All categories"); setReviewOnly(false); setActiveTab("Transactions"); setSearchOpen(false); }}>View all {quickSearchResults.length} matches <Icon name="arrow" size={14} /></button>}
+              </div>}
+            </div>
+            <div className="notification-wrap" ref={notificationRef}><button ref={notificationButtonRef} className="icon-button notification" type="button" aria-label="Notifications" aria-expanded={notificationsOpen} aria-controls="notification-panel" onClick={() => { setSearchOpen(false); setNotificationsOpen((open) => !open); }}><Icon name="bell" size={18} />{reviewCount > 0 && <span className="review-count">{reviewCount}</span>}</button>{notificationsOpen && <div className="notification-panel" id="notification-panel" aria-label="Notifications"><div className="notification-heading"><strong>Notifications</strong><span>{reviewCount ? `${reviewCount} need review` : "You're up to date"}</span></div><div className="notification-list">{reviewCount > 0 && <button className="notification-item" type="button" onClick={() => { setSearch(""); setCategoryFilter("All categories"); setReviewOnly(true); setActiveTab("Transactions"); setNotificationsOpen(false); }}><span className="notification-symbol review">!</span><span><strong>{reviewCount} {reviewCount === 1 ? "transaction needs" : "transactions need"} review</strong><small>Check imported merchants and categories.</small></span><Icon name="arrow" size={15} /></button>}{savedStatements.slice(0, 5).map((statement) => <button className="notification-item" type="button" key={statement.id} onClick={() => { setBudgetSetupRequired(false); setBackupMessage(""); setBudgetDraft({ monthlyIncome: String(settings.monthlyIncome), spendingLimit: String(settings.spendingLimit) }); setShowBudgetSetup(true); setNotificationsOpen(false); }}><span className="notification-symbol saved">✓</span><span><strong>Statement added</strong><small>{statement.name} · {statement.transactionCount} {statement.transactionCount === 1 ? "transaction" : "transactions"} · {new Date(statement.importedAt).toLocaleDateString("en-CA", { month: "short", day: "numeric" })}</small></span><Icon name="arrow" size={15} /></button>)}{!reviewCount && !savedStatements.length && <p className="notification-empty">No notifications yet. Imported statements and items needing review will appear here.</p>}</div></div>}</div>
+          </div>
+        </header>
 
         <div className="content-inner">
-          {activeTab === "Overview" && <Overview month={month} setMonth={setMonth} onImport={openImport} onAdd={openAddTransaction} onOpenTransactions={() => setActiveTab("Transactions")} onOpenCategories={() => setActiveTab("Categories")} onReports={() => setActiveTab("Reports")} transactions={monthTransactions} settings={settings} categories={budgetCategories} accounts={accounts} onEditTransaction={openEditTransaction} />}
-          {activeTab === "Transactions" && <TransactionsPage transactions={filteredTransactions} search={search} setSearch={setSearch} categoryFilter={categoryFilter} setCategoryFilter={setCategoryFilter} onImport={openImport} onAdd={openAddTransaction} categoryOptions={categoryOptions} onEdit={openEditTransaction} onExport={() => exportTransactions(filteredTransactions)} />}
-          {activeTab === "Categories" && <CategoriesPage settings={settings} categories={budgetCategories} transactions={monthTransactions} onAdd={openAddCategory} onEdit={openEditCategory} />}
+          {storageError && <div className="storage-error" role="alert">Saved data is unavailable: {storageError} Changes may not be kept. Reload after checking browser storage.</div>}
+          {activeTab === "Overview" && <Overview month={month} monthOptions={monthOptions} setMonth={setMonth} onImport={openImport} onAdd={openAddTransaction} onOpenTransactions={() => setActiveTab("Transactions")} onOpenCategories={() => setActiveTab("Categories")} onReports={() => setActiveTab("Reports")} onOpenPlan={() => setActiveTab("Plan")} onAddAccount={() => openAccountEditor()} onAddGoal={() => openGoalEditor()} onAddRecurring={() => openRecurringEditor()} onEditGoal={openGoalEditor} onEditRecurring={openRecurringEditor} transactions={monthTransactions} settings={settings} categories={budgetCategories} accounts={accounts} goals={goals} recurringItems={recurringItems} onEditTransaction={openEditTransaction} />}
+          {activeTab === "Transactions" && <TransactionsPage transactions={filteredTransactions} searchRef={searchRef} reviewOnly={reviewOnly} setReviewOnly={setReviewOnly} search={search} setSearch={setSearch} categoryFilter={categoryFilter} setCategoryFilter={setCategoryFilter} onImport={openImport} onAdd={openAddTransaction} categoryOptions={categoryOptions} onEdit={openEditTransaction} onExport={() => exportTransactions(filteredTransactions)} />}
+          {activeTab === "Categories" && <CategoriesPage month={month} monthOptions={monthOptions} setMonth={setMonth} settings={settings} categories={budgetCategories} transactions={monthTransactions} onAdd={openAddCategory} onEdit={openEditCategory} />}
           {activeTab === "Plan" && <PlanPage accounts={accounts} goals={goals} recurringItems={recurringItems} onAddAccount={() => openAccountEditor()} onEditAccount={openAccountEditor} onAddGoal={() => openGoalEditor()} onEditGoal={openGoalEditor} onAddRecurring={() => openRecurringEditor()} onEditRecurring={openRecurringEditor} />}
-          {activeTab === "Reports" && <ReportsPage transactions={monthTransactions} settings={settings} categories={budgetCategories} accounts={accounts} goals={goals} recurringItems={recurringItems} month={month} onDownload={exportReport} onOpenPlan={() => setActiveTab("Plan")} />}
+          {activeTab === "Reports" && <ReportsPage transactions={monthTransactions} settings={settings} categories={budgetCategories} accounts={accounts} goals={goals} recurringItems={recurringItems} month={month} monthOptions={monthOptions} setMonth={setMonth} onDownload={exportReport} onOpenPlan={() => setActiveTab("Plan")} />}
         </div>
       </section>
 
-      {showBudgetSetup && <div className="modal-backdrop">{!budgetSetupRequired && <button className="modal-backdrop-close" type="button" aria-label="Close settings" onClick={() => setShowBudgetSetup(false)} />}<div className="modal setup-modal">{!budgetSetupRequired && <button className="modal-close" type="button" onClick={() => setShowBudgetSetup(false)}>×</button>}<div className="modal-icon budget-icon">$</div><h2>Budget settings & backup</h2><p className="modal-sub">These numbers power your available-to-spend, savings rate, and forecast. Everything stays on this device.</p><form onSubmit={saveBudget}><label>Monthly take-home income<div className="money-input"><span>CAD</span><input value={budgetDraft.monthlyIncome} onChange={(event) => setBudgetDraft({ ...budgetDraft, monthlyIncome: event.target.value })} type="number" min="1" step="50" /></div></label><label>Monthly spending limit<div className="money-input"><span>CAD</span><input value={budgetDraft.spendingLimit} onChange={(event) => setBudgetDraft({ ...budgetDraft, spendingLimit: event.target.value })} type="number" min="1" step="50" /></div></label><div className="local-note"><span>✓</span><p><strong>Local for now</strong>Your financial data is saved only in this browser.</p></div><button className="primary-button full" type="submit">Save budget settings <Icon name="arrow" size={16} /></button></form>{!budgetSetupRequired && <div className="backup-actions"><div><strong>Portable local backup</strong><span>Download all Pocketwise data, or restore it on this device.</span></div><div><button className="secondary-button small" type="button" onClick={downloadBackup}><Icon name="backup" size={14} /> Download</button><button className="secondary-button small" type="button" onClick={() => backupRef.current?.click()}><Icon name="upload" size={14} /> Restore</button></div><input ref={backupRef} className="hidden-input" type="file" accept=".json,application/json" onChange={(event) => { const file = event.target.files?.[0]; if (file) void restoreBackup(file); event.target.value = ""; }} />{backupMessage && <p className="backup-message" role="status">{backupMessage}</p>}</div>}</div></div>}
-      {showImport && <div className="modal-backdrop"><button className="modal-backdrop-close" type="button" aria-label="Close statement import" onClick={() => setShowImport(false)} /><div className="modal import-modal"><button className="modal-close" onClick={() => setShowImport(false)}>×</button><div className="modal-icon"><Icon name="upload" size={22} /></div><h2>Import a statement</h2><p className="modal-sub">Searchable PDFs from RBC, TD, Scotiabank, BMO, CIBC, National Bank, and Amex are analyzed locally by their contents. The file name does not matter.</p><div className="dropzone" onDragOver={(event) => event.preventDefault()} onDrop={dropFile}><div className="drop-icon"><Icon name="upload" size={18} /></div><div><strong>{importMessage || "Drop a statement here"}</strong><span>CSV or PDF · up to 10 MB</span></div><button className="text-button" onClick={() => fileRef.current?.click()}>Choose file</button></div><input ref={fileRef} className="hidden-input" type="file" accept=".csv,.pdf" onChange={chooseFile} />{importWarnings.length > 0 && <div className="import-warnings" role="status">{importWarnings.map((warning) => <p key={warning}>⚠ {warning}</p>)}</div>}{(importCounts.found > 0 || importCounts.duplicates > 0) && <div className="import-summary"><div><span className="summary-number">{importCounts.found}</span><span>new line items</span></div><div><span className="summary-number peach">{importCounts.review}</span><span>need your review</span></div>{importCounts.duplicates > 0 && <div><span className="summary-number muted">{importCounts.duplicates}</span><span>duplicates skipped</span></div>}</div>}<button className="primary-button full" disabled={!pendingImport.length} onClick={() => { setTransactions((current) => [...pendingImport, ...current]); setActiveTab("Transactions"); setShowImport(false); }}>Add new transactions <Icon name="arrow" size={16} /></button></div></div>}
+      {showBudgetSetup && <div className="modal-backdrop">{!budgetSetupRequired && <button className="modal-backdrop-close" type="button" aria-label="Close settings" onClick={() => setShowBudgetSetup(false)} />}<div className="modal setup-modal">{!budgetSetupRequired && <button className="modal-close" type="button" onClick={() => setShowBudgetSetup(false)}>×</button>}<div className="modal-icon budget-icon">$</div><h2>Budget settings & backup</h2><p className="modal-sub">These numbers power your available-to-spend, savings rate, and forecast. Everything stays on this device.</p><form onSubmit={saveBudget}><label>Monthly take-home income<div className="money-input"><span>CAD</span><input value={budgetDraft.monthlyIncome} onChange={(event) => setBudgetDraft({ ...budgetDraft, monthlyIncome: event.target.value })} type="number" min="1" step="50" /></div></label><label>Monthly spending limit<div className="money-input"><span>CAD</span><input value={budgetDraft.spendingLimit} onChange={(event) => setBudgetDraft({ ...budgetDraft, spendingLimit: event.target.value })} type="number" min="1" step="50" /></div></label><div className="local-note"><span>✓</span><p><strong>Local for now</strong>Your financial data is saved only in this browser.</p></div><button className="primary-button full" type="submit">Save budget settings <Icon name="arrow" size={16} /></button></form>{!budgetSetupRequired && <div className="backup-actions"><div><strong>Data backup</strong><span>Download or restore app data as JSON. Original statement files are downloaded separately below.</span></div><div><button className="secondary-button small" type="button" onClick={downloadBackup}><Icon name="backup" size={14} /> Download</button><button className="secondary-button small" type="button" onClick={() => backupRef.current?.click()}><Icon name="upload" size={14} /> Restore</button></div><input ref={backupRef} className="hidden-input" type="file" accept=".json,application/json" onChange={(event) => { const file = event.target.files?.[0]; if (file) void restoreBackup(file); event.target.value = ""; }} />{backupMessage && <p className="backup-message" role="status">{backupMessage}</p>}</div>}<div className="saved-statements"><strong>Original statements</strong><p>Stored separately from the transactions shown in Pocketwise, in this browser only.</p>{savedStatements.length ? <ul>{savedStatements.map((statement) => <li key={statement.id}><span><strong>{statement.name}</strong><small>{new Date(statement.importedAt).toLocaleDateString("en-CA")} · {statement.transactionCount} added transactions</small></span><button className="secondary-button small" type="button" onClick={() => void downloadStatement(statement)}>Download</button></li>)}</ul> : <p>No original statements saved yet.</p>}</div></div></div>}
+      {showImport && <div className="modal-backdrop"><button className="modal-backdrop-close" type="button" aria-label="Close statement import" onClick={() => setShowImport(false)} /><div className="modal import-modal"><button className="modal-close" onClick={() => setShowImport(false)}>×</button><div className="modal-icon"><Icon name="upload" size={22} /></div><h2>Import a statement</h2><p className="modal-sub">Searchable PDFs from RBC, TD, Scotiabank, BMO, CIBC, National Bank, and Amex are analyzed locally by their contents. The file name does not matter.</p><div className="dropzone" onDragOver={(event) => event.preventDefault()} onDrop={dropFile}><div className="drop-icon"><Icon name="upload" size={18} /></div><div><strong>{importMessage || "Drop a statement here"}</strong><span>CSV or PDF · up to 10 MB</span></div><button className="text-button" onClick={() => fileRef.current?.click()}>Choose file</button></div><input ref={fileRef} className="hidden-input" type="file" accept=".csv,.pdf" onChange={chooseFile} />{importWarnings.length > 0 && <div className="import-warnings" role="status">{importWarnings.map((warning) => <p key={warning}>⚠ {warning}</p>)}</div>}{(importCounts.found > 0 || importCounts.duplicates > 0) && <div className="import-summary"><div><span className="summary-number">{importCounts.found}</span><span>new line items</span></div><div><span className="summary-number peach">{importCounts.review}</span><span>need your review</span></div>{importCounts.duplicates > 0 && <div><span className="summary-number muted">{importCounts.duplicates}</span><span>duplicates skipped</span></div>}</div>}<button className="primary-button full" disabled={!pendingFile || !storageReady || importSaving} onClick={() => void confirmImport()}>{importSaving ? "Saving…" : pendingImport.length ? "Add transactions and save original" : "Save original statement"} <Icon name="arrow" size={16} /></button></div></div>}
       {categoryEditorMode && <div className="modal-backdrop"><button className="modal-backdrop-close" type="button" aria-label="Close category editor" onClick={closeCategoryEditor} /><div className="modal category-modal"><button className="modal-close" type="button" onClick={closeCategoryEditor}>×</button><div className="modal-icon category-modal-icon"><Icon name="tag" size={20} /></div><h2>{categoryEditorMode === "add" ? "Add a custom category" : "Edit category limit"}</h2><p className="modal-sub">Set the monthly amount you want to reserve for this category. Changes stay on this device.</p><form onSubmit={saveCategory}><label>Category name<input value={categoryDraft.name} disabled={categoryEditorMode === "edit" && !activeEditingCategory?.custom} maxLength={40} onChange={(event) => { setCategoryDraft({ ...categoryDraft, name: event.target.value }); setCategoryError(""); }} placeholder="e.g. Travel" /></label><label>Monthly limit<div className="money-input"><span>CAD</span><input value={categoryDraft.limit} onChange={(event) => { setCategoryDraft({ ...categoryDraft, limit: event.target.value }); setCategoryError(""); }} type="number" min="0" step="1" placeholder="0" /></div></label>{categoryError && <p className="form-error" role="alert">{categoryError}</p>}<button className="primary-button full" type="submit">{categoryEditorMode === "add" ? "Add category" : "Save limit"} <Icon name="arrow" size={16} /></button></form></div></div>}
-      {showModal && <div className="modal-backdrop"><button className="modal-backdrop-close" type="button" aria-label="Close transaction form" onClick={() => { setShowModal(false); setEditingTransactionId(null); }} /><div className="modal"><button className="modal-close" type="button" onClick={() => { setShowModal(false); setEditingTransactionId(null); }}>×</button><h2>{editingTransactionId === null ? "Add transaction" : "Edit transaction"}</h2><p className="modal-sub">{editingTransactionId === null ? "Record something that isn’t in a statement." : "Correct the merchant, amount, date, or category used in your reports."}</p><form onSubmit={saveTransaction}><label>Merchant<input value={form.merchant} onChange={(event) => setForm({ ...form, merchant: event.target.value })} placeholder="e.g. Corner store" required /></label><div className="form-row"><label>Type<select value={form.kind} onChange={(event) => { const kind = event.target.value as TransactionDraft["kind"]; setForm({ ...form, kind, category: kind === "income" ? "Income" : form.category === "Income" ? "Other" : form.category }); }}><option value="expense">Expense</option><option value="income">Income</option></select></label><label>Amount (CAD)<input value={form.amount} onChange={(event) => setForm({ ...form, amount: event.target.value })} placeholder="0.00" type="number" min="0.01" step="0.01" required /></label></div><div className="form-row"><label>Category<select value={form.category} onChange={(event) => setForm({ ...form, category: event.target.value })}>{categoryOptions.map((category) => <option key={category}>{category}</option>)}</select></label><label>Date<input value={form.date} onChange={(event) => setForm({ ...form, date: event.target.value })} placeholder="YYYY-MM-DD" /></label></div><label>Note <span className="optional">optional</span><input value={form.note} onChange={(event) => setForm({ ...form, note: event.target.value })} placeholder="Add a note" /></label><div className="modal-actions">{editingTransactionId !== null && <button className="danger-button" type="button" onClick={deleteTransaction}><Icon name="trash" size={14} /> Delete</button>}<button className="primary-button" type="submit">Save transaction <Icon name="arrow" size={16} /></button></div></form></div></div>}
+      {showModal && <div className="modal-backdrop"><button className="modal-backdrop-close" type="button" aria-label="Close transaction form" onClick={() => { setShowModal(false); setEditingTransactionId(null); }} /><div className="modal"><button className="modal-close" type="button" onClick={() => { setShowModal(false); setEditingTransactionId(null); }}>×</button><h2>{editingTransactionId === null ? "Add transaction" : "Edit transaction"}</h2><p className="modal-sub">{editingTransactionId === null ? "Record something that isn’t in a statement." : "Correct the merchant, amount, date, or category used in your reports."}</p><form onSubmit={saveTransaction}><label>Merchant<input value={form.merchant} onChange={(event) => setForm({ ...form, merchant: event.target.value })} placeholder="e.g. Corner store" required /></label><div className="form-row"><label>Type<select value={form.kind} onChange={(event) => { const kind = event.target.value as TransactionDraft["kind"]; setForm({ ...form, kind, category: kind === "income" ? "Income" : form.category === "Income" ? "Other" : form.category }); }}><option value="expense">Expense</option><option value="income">Income</option></select></label><label>Amount (CAD)<input value={form.amount} onChange={(event) => setForm({ ...form, amount: event.target.value })} placeholder="0.00" type="number" min="0.01" step="0.01" required /></label></div><div className="form-row"><label>Category<select value={form.category} onChange={(event) => setForm({ ...form, category: event.target.value })}>{categoryOptions.map((category) => <option key={category}>{category}</option>)}</select></label><label>Date<input value={form.date} onChange={(event) => setForm({ ...form, date: event.target.value })} type="date" /></label></div><label>Note <span className="optional">optional</span><input value={form.note} onChange={(event) => setForm({ ...form, note: event.target.value })} placeholder="Add a note" /></label><div className="modal-actions">{editingTransactionId !== null && <button className="danger-button" type="button" onClick={deleteTransaction}><Icon name="trash" size={14} /> Delete</button>}<button className="primary-button" type="submit">Save transaction <Icon name="arrow" size={16} /></button></div></form></div></div>}
       {plannerEditor && <div className="modal-backdrop"><button className="modal-backdrop-close" type="button" aria-label="Close planning form" onClick={closePlannerEditor} /><div className="modal planner-modal"><button className="modal-close" type="button" onClick={closePlannerEditor}>×</button><div className="modal-icon category-modal-icon"><Icon name="target" size={20} /></div><h2>{plannerEditingId ? "Edit" : "Add"} {plannerEditor === "account" ? "account balance" : plannerEditor === "goal" ? "savings goal" : "recurring item"}</h2><p className="modal-sub">This information stays in your browser and feeds your plan, net worth, and financial-health report.</p>
         {plannerEditor === "account" && <form onSubmit={saveAccount}><label>Account name<input value={accountDraft.name} onChange={(event) => { setAccountDraft({ ...accountDraft, name: event.target.value }); setPlannerError(""); }} placeholder="e.g. Emergency savings" required /></label><div className="form-row"><label>Balance type<select value={accountDraft.kind} onChange={(event) => { const kind = event.target.value as AccountKind; setAccountDraft({ ...accountDraft, kind, type: kind === "asset" ? "Chequing" : "Credit card" }); }}><option value="asset">Asset — I own it</option><option value="liability">Debt — I owe it</option></select></label><label>Account type<select value={accountDraft.type} onChange={(event) => setAccountDraft({ ...accountDraft, type: event.target.value as AccountType })}>{accountTypes.filter((type) => accountDraft.kind === "asset" ? !["Credit card", "Line of credit", "Loan", "Mortgage"].includes(type) : !["Chequing", "Savings", "Cash", "Investment"].includes(type)).map((type) => <option key={type}>{type}</option>)}</select></label></div><label>Current balance<div className="money-input"><span>CAD</span><input value={accountDraft.balance} onChange={(event) => { setAccountDraft({ ...accountDraft, balance: event.target.value }); setPlannerError(""); }} type="number" min="0" step="0.01" placeholder="0.00" required /></div></label>{plannerError && <p className="form-error" role="alert">{plannerError}</p>}<PlannerModalActions editing={Boolean(plannerEditingId)} onDelete={deletePlannerItem} label="Save account" /></form>}
         {plannerEditor === "goal" && <form onSubmit={saveGoal}><label>Goal name<input value={goalDraft.name} onChange={(event) => { setGoalDraft({ ...goalDraft, name: event.target.value }); setPlannerError(""); }} placeholder="e.g. Emergency fund" required /></label><div className="form-row"><label>Target amount<input value={goalDraft.targetAmount} onChange={(event) => setGoalDraft({ ...goalDraft, targetAmount: event.target.value })} type="number" min="0.01" step="0.01" placeholder="0.00" required /></label><label>Already saved<input value={goalDraft.currentAmount} onChange={(event) => setGoalDraft({ ...goalDraft, currentAmount: event.target.value })} type="number" min="0" step="0.01" placeholder="0.00" /></label></div><label>Target date <span className="optional">optional</span><input value={goalDraft.targetDate} onChange={(event) => setGoalDraft({ ...goalDraft, targetDate: event.target.value })} type="date" /></label>{plannerError && <p className="form-error" role="alert">{plannerError}</p>}<PlannerModalActions editing={Boolean(plannerEditingId)} onDelete={deletePlannerItem} label="Save goal" /></form>}
         {plannerEditor === "recurring" && <form onSubmit={saveRecurring}><label>Name<input value={recurringDraft.name} onChange={(event) => { setRecurringDraft({ ...recurringDraft, name: event.target.value }); setPlannerError(""); }} placeholder="e.g. Internet bill" required /></label><div className="form-row"><label>Amount (CAD)<input value={recurringDraft.amount} onChange={(event) => setRecurringDraft({ ...recurringDraft, amount: event.target.value })} type="number" min="0.01" step="0.01" placeholder="0.00" required /></label><label>Frequency<select value={recurringDraft.frequency} onChange={(event) => setRecurringDraft({ ...recurringDraft, frequency: event.target.value as RecurringFrequency })}>{recurringFrequencies.map((frequency) => <option key={frequency}>{frequency}</option>)}</select></label></div><div className="form-row"><label>Category<select value={recurringDraft.category} onChange={(event) => setRecurringDraft({ ...recurringDraft, category: event.target.value })}>{categoryOptions.filter((category) => category !== "Income").map((category) => <option key={category}>{category}</option>)}</select></label><label>Next date <span className="optional">optional</span><input value={recurringDraft.nextDate} onChange={(event) => setRecurringDraft({ ...recurringDraft, nextDate: event.target.value })} type="date" /></label></div>{plannerError && <p className="form-error" role="alert">{plannerError}</p>}<PlannerModalActions editing={Boolean(plannerEditingId)} onDelete={deletePlannerItem} label="Save recurring item" /></form>}
       </div></div>}
     </main>
+    {!storageReady && <div className="startup-cover" role={storageError ? "alert" : "status"}><div className="startup-card"><span className="brand-mark">↗</span><strong>{storageError ? "Your saved workspace could not open" : "Opening your workspace"}</strong><p>{storageError || "Loading your private data from this browser…"}</p>{storageError && <button className="secondary-button" type="button" onClick={() => window.location.reload()}>Try again</button>}</div></div>}
+    </>
   );
 }
 
+// Render the shared save and optional delete actions for planner forms.
 function PlannerModalActions({ editing, onDelete, label }: { editing: boolean; onDelete: () => void; label: string }) {
   return <div className="modal-actions">{editing && <button className="danger-button" type="button" onClick={onDelete}><Icon name="trash" size={14} /> Delete</button>}<button className="primary-button" type="submit">{label} <Icon name="arrow" size={16} /></button></div>;
 }
 
-function Overview({ month, setMonth, onImport, onAdd, onOpenTransactions, onOpenCategories, onReports, transactions, settings, categories, accounts, onEditTransaction }: { month: string; setMonth: (value: string) => void; onImport: () => void; onAdd: () => void; onOpenTransactions: () => void; onOpenCategories: () => void; onReports: () => void; transactions: Transaction[]; settings: BudgetSettings; categories: BudgetCategory[]; accounts: FinancialAccount[]; onEditTransaction: (transaction: Transaction) => void }) {
+// Render a month selector shared by the overview, categories, and reports.
+function MonthPicker({ month, options, onChange }: { month: string; options: string[]; onChange: (value: string) => void }) {
+  return <label className="month-select"><span>{month}</span><Icon name="chevron" size={14} /><select value={month} onChange={(event) => onChange(event.target.value)} aria-label="Select month">{options.map((option) => <option key={option} value={option}>{option}</option>)}</select></label>;
+}
+
+// Calculate and display the selected month's summary and spending trends.
+function Overview({ month, monthOptions, setMonth, onImport, onAdd, onOpenTransactions, onOpenCategories, onReports, onOpenPlan, onAddAccount, onAddGoal, onAddRecurring, onEditGoal, onEditRecurring, transactions, settings, categories, accounts, goals, recurringItems, onEditTransaction }: { month: string; monthOptions: string[]; setMonth: (value: string) => void; onImport: () => void; onAdd: () => void; onOpenTransactions: () => void; onOpenCategories: () => void; onReports: () => void; onOpenPlan: () => void; onAddAccount: () => void; onAddGoal: () => void; onAddRecurring: () => void; onEditGoal: (goal: SavingsGoal) => void; onEditRecurring: (item: RecurringItem) => void; transactions: Transaction[]; settings: BudgetSettings; categories: BudgetCategory[]; accounts: FinancialAccount[]; goals: SavingsGoal[]; recurringItems: RecurringItem[]; onEditTransaction: (transaction: Transaction) => void }) {
+  const hasActivity = transactions.length > 0;
   const expenses = transactions.filter((item) => item.amount < 0 && item.category !== "Payments & transfers").reduce((total, item) => total + Math.abs(item.amount), 0);
   const fixedSpending = transactions.filter((item) => item.amount < 0 && ["Housing", "Utilities"].includes(item.category)).reduce((total, item) => total + Math.abs(item.amount), 0);
   const variableSpending = Math.max(0, expenses - fixedSpending);
@@ -865,18 +1101,43 @@ function Overview({ month, setMonth, onImport, onAdd, onOpenTransactions, onOpen
       },
     ];
   return <>
-    <div className="page-heading"><div><p className="eyebrow">GOOD EVENING, JAMIE</p><h1>Here’s your money story.</h1><p className="heading-sub">A clear view of where you are, and where you’re headed.</p></div><div className="heading-actions"><label className="month-select"><span>{month}</span><Icon name="chevron" size={14} /><select value={month} onChange={(event) => setMonth(event.target.value)} aria-label="Select month"><option>August 2026</option><option>July 2026</option><option>June 2026</option><option>December 2025</option></select></label><button className="primary-button" onClick={onAdd}><Icon name="plus" size={16} /> Add transaction</button></div></div>
-    <div className="import-banner"><div className="import-art"><span>CSV</span><span>PDF</span><i /></div><div className="import-copy"><strong>Bring in your latest statement</strong><span>Drop a CSV or PDF here and we’ll sort the line items for you.</span></div><button className="secondary-button" onClick={onImport}><Icon name="upload" size={15} /> Import statement</button></div>
-    <div className="metric-grid"><MetricCard label="Available to spend" value={`${available < 0 ? "−" : ""}${money(available)}`} detail={`of ${money(settings.spendingLimit)} monthly plan`} trend={available >= 0 ? "On plan" : "Over plan"} trendType={available >= 0 ? "positive" : "warning"} icon="wallet" /><MetricCard label="Spent this month" value={money(expenses)} detail="Across imported and manual entries" trend={`${Math.round((expenses / settings.spendingLimit) * 100)}%`} trendType="neutral" icon="trend" /><MetricCard label="Projected month-end" value={money(projectedSpending)} detail="Recurring costs + recent daily average" trend={projectedSpending <= settings.spendingLimit ? "Within limit" : "Above limit"} trendType={projectedSpending <= settings.spendingLimit ? "positive" : "warning"} icon="forecast" /><MetricCard label="Projected savings rate" value={`${savingsRate.toFixed(1)}%`} detail={`Based on ${money(settings.monthlyIncome)} income`} trend="Forecast" trendType="neutral" icon="leaf" /></div>
-    <div className="main-grid"><section className="panel spending-panel"><div className="panel-heading"><div><h2>Spending over time</h2><p>{month} · live from your transactions</p></div><button className="ghost-button" onClick={onReports}>View report <Icon name="arrow" size={14} /></button></div><div className="chart-legend"><span><i className="legend-dot purple" /> Spent</span><span><i className="legend-dot peach" /> Planned pace</span></div><SpendingChart month={month} transactions={transactions} spendingLimit={settings.spendingLimit} /></section><section className="panel health-panel"><div className="panel-heading"><div><h2>Financial health</h2><p>Calculated from this month</p></div><span className={`health-badge ${health.status === "Needs attention" ? "warning" : ""}`}>{health.status}</span></div><div className="health-ring" style={{ background: `conic-gradient(#82c8ac 0 ${health.score}%, #f0edeb ${health.score}% 100%)` }}><div><strong>{health.score}</strong><span>/ 100</span></div></div><p className="health-copy">{health.message}</p><div className="health-breakdown"><div><span className="health-line mint" /><span>Cash flow</span><strong>{health.cashFlowScore}</strong></div><div><span className="health-line purple" /><span>Spending plan</span><strong>{health.spendingPlanScore}</strong></div><div><span className="health-line peach" /><span>Emergency fund</span><strong>{health.emergencyFundScore ?? "—"}</strong></div></div></section></div>
-    <div className="lower-grid"><section className="panel transactions-panel"><div className="panel-heading"><div><h2>Recent transactions</h2><p>Latest activity across your accounts</p></div><button className="ghost-button" onClick={onOpenTransactions}>See all <Icon name="arrow" size={14} /></button></div><TransactionList transactions={transactions.slice(0, 4)} onEdit={onEditTransaction} /></section><section className="panel category-panel"><div className="panel-heading"><div><h2>Where it’s going</h2><p>Spend by category</p></div><button className="ghost-button" onClick={onOpenCategories}>Edit limits <Icon name="arrow" size={14} /></button></div><div className="donut-wrap"><div className="donut" style={{ background: donutBackground }}><div className="donut-hole"><strong>{money(expenses)}</strong><span>total spent</span></div></div><div className="donut-legend">{categoryLegend.length ? categoryLegend.map((category) => <span key={category.id}><i style={{ background: category.color }} /> {category.name} <strong>{expenses ? Math.round((category.amount / expenses) * 100) : 0}%</strong></span>) : <span className="empty-category-copy">No spending yet</span>}</div></div><div className="category-foot"><span>Monthly budget</span><strong>{money(settings.spendingLimit)} <small>· {settings.spendingLimit ? Math.round((expenses / settings.spendingLimit) * 100) : 0}% used</small></strong></div></section></div>
+    <div className="page-heading"><div><p className="eyebrow">YOUR MONTH AT A GLANCE</p><h1>Here’s your money story.</h1><p className="heading-sub">A clear view of where you are, and where you’re headed.</p></div><div className="heading-actions"><MonthPicker month={month} options={monthOptions} onChange={setMonth} /><button className="primary-button" onClick={onAdd}><Icon name="plus" size={16} /> Add transaction</button></div></div>
+    <div className={`import-banner ${hasActivity ? "" : "empty"}`}><div className="import-art"><span>CSV</span><span>PDF</span><i /></div><div className="import-copy"><strong>{hasActivity ? "Bring in your latest statement" : `No activity in ${month} yet`}</strong><span>{hasActivity ? "Drop a CSV or PDF here and we’ll sort the line items for you." : "Import a statement or add a transaction to start seeing your money picture."}</span></div><button className="secondary-button" onClick={onImport}><Icon name="upload" size={15} /> Import statement</button></div>
+    <div className="metric-grid"><MetricCard label="Available to spend" value={`${available < 0 ? "−" : ""}${money(available)}`} detail={`of ${money(settings.spendingLimit)} monthly plan`} trend={available >= 0 ? "On plan" : "Over plan"} trendType={available >= 0 ? "positive" : "warning"} icon="wallet" /><MetricCard label="Spent this month" value={money(expenses)} detail="Across imported and manual entries" trend={`${Math.round((expenses / settings.spendingLimit) * 100)}%`} trendType="neutral" icon="trend" /><MetricCard label="Projected month-end" value={hasActivity ? money(projectedSpending) : "—"} detail={hasActivity ? "Recurring costs + recent daily average" : "Add transactions to calculate"} trend={hasActivity ? projectedSpending <= settings.spendingLimit ? "Within limit" : "Above limit" : "Waiting for activity"} trendType={hasActivity && projectedSpending > settings.spendingLimit ? "warning" : "neutral"} icon="forecast" /><MetricCard label="Projected savings rate" value={hasActivity ? `${savingsRate.toFixed(1)}%` : "—"} detail={hasActivity ? `Based on ${money(settings.monthlyIncome)} income` : "Add transactions to calculate"} trend={hasActivity ? "Forecast" : "Waiting for activity"} trendType="neutral" icon="leaf" /></div>
+    <PlanPreview accounts={accounts} goals={goals} recurringItems={recurringItems} onOpenPlan={onOpenPlan} onAddAccount={onAddAccount} onAddGoal={onAddGoal} onAddRecurring={onAddRecurring} onEditGoal={onEditGoal} onEditRecurring={onEditRecurring} />
+    <div className="main-grid"><section className="panel spending-panel"><div className="panel-heading"><div><h2>Spending over time</h2><p>{month} · live from your transactions</p></div><button className="ghost-button" onClick={onReports}>View report <Icon name="arrow" size={14} /></button></div><div className="chart-legend"><span><i className="legend-dot purple" /> Spent</span><span><i className="legend-dot peach" /> Planned pace</span></div><SpendingChart month={month} transactions={transactions} spendingLimit={settings.spendingLimit} /></section><section className="panel health-panel"><div className="panel-heading"><div><h2>Financial health</h2><p>Calculated from this month</p></div><span className={`health-badge ${health.status === "Needs attention" ? "warning" : ""}`}>{hasActivity ? health.status : "Waiting for data"}</span></div><div className="health-ring" style={{ background: hasActivity ? `conic-gradient(#82c8ac 0 ${health.score}%, #f0edeb ${health.score}% 100%)` : "#f0edeb" }}><div><strong>{hasActivity ? health.score : "—"}</strong><span>{hasActivity ? "/ 100" : "score"}</span></div></div><p className="health-copy">{hasActivity ? health.message : "Add transactions to see a score based on your spending plan."}</p><div className="health-breakdown"><div><span className="health-line mint" /><span>Cash flow</span><strong>{hasActivity ? health.cashFlowScore : "—"}</strong></div><div><span className="health-line purple" /><span>Spending plan</span><strong>{hasActivity ? health.spendingPlanScore : "—"}</strong></div><div><span className="health-line peach" /><span>Emergency fund</span><strong>{hasActivity ? health.emergencyFundScore ?? "—" : "—"}</strong></div></div></section></div>
+    <div className="lower-grid"><section className="panel transactions-panel"><div className="panel-heading"><div><h2>Recent transactions</h2><p>Latest activity across your accounts</p></div><button className="ghost-button" onClick={onOpenTransactions}>See all <Icon name="arrow" size={14} /></button></div><TransactionList transactions={transactions.slice(0, 4)} onEdit={onEditTransaction} emptyMessage={`No transactions in ${month} yet.`} /></section><section className="panel category-panel"><div className="panel-heading"><div><h2>Where it’s going</h2><p>Spend by category</p></div><button className="ghost-button" onClick={onOpenCategories}>Edit limits <Icon name="arrow" size={14} /></button></div><div className="donut-wrap"><div className="donut" style={{ background: donutBackground }}><div className="donut-hole"><strong>{money(expenses)}</strong><span>total spent</span></div></div><div className="donut-legend">{categoryLegend.length ? categoryLegend.map((category) => <span key={category.id}><i style={{ background: category.color }} /> {category.name} <strong>{expenses ? Math.round((category.amount / expenses) * 100) : 0}%</strong></span>) : <span className="empty-category-copy">No spending yet</span>}</div></div><div className="category-foot"><span>Monthly budget</span><strong>{money(settings.spendingLimit)} <small>· {settings.spendingLimit ? Math.round((expenses / settings.spendingLimit) * 100) : 0}% used</small></strong></div></section></div>
   </>;
 }
 
+// Surface the most useful plan details on Overview while keeping the full editor in Plan.
+function PlanPreview({ accounts, goals, recurringItems, onOpenPlan, onAddAccount, onAddGoal, onAddRecurring, onEditGoal, onEditRecurring }: { accounts: FinancialAccount[]; goals: SavingsGoal[]; recurringItems: RecurringItem[]; onOpenPlan: () => void; onAddAccount: () => void; onAddGoal: () => void; onAddRecurring: () => void; onEditGoal: (goal: SavingsGoal) => void; onEditRecurring: (item: RecurringItem) => void }) {
+  const netWorth = calculateNetWorth(accounts);
+  const monthlyRecurring = calculateMonthlyRecurringTotal(recurringItems);
+  const savedTowardGoals = goals.reduce((total, goal) => total + Math.min(goal.currentAmount, goal.targetAmount), 0);
+  const previewGoals = [...goals]
+    .sort((left, right) => Number(left.currentAmount >= left.targetAmount) - Number(right.currentAmount >= right.targetAmount)
+      || (left.targetDate || "9999").localeCompare(right.targetDate || "9999"))
+    .slice(0, 2);
+  const firstRecurring = [...recurringItems]
+    .sort((left, right) => (left.nextDate || "9999").localeCompare(right.nextDate || "9999"))[0];
+
+  return <section className="overview-plan" aria-labelledby="overview-plan-title">
+    <div className="overview-plan-heading"><div><p className="eyebrow">LOOKING AHEAD</p><h2 id="overview-plan-title">Your plan at a glance</h2><p>Goals, balances, and known commitments stay close to your monthly picture.</p></div><button className="ghost-button" type="button" onClick={onOpenPlan}>View full plan <Icon name="arrow" size={14} /></button></div>
+    <div className="overview-plan-grid">
+      <article className="panel overview-plan-card"><div className="overview-plan-card-title"><span className="overview-plan-icon goal">◎</span><h3>Savings goals</h3></div>{goals.length ? <><p className="overview-plan-summary">{money(savedTowardGoals)} saved across {goals.length} {goals.length === 1 ? "goal" : "goals"}</p><div className="overview-goal-list">{previewGoals.map((goal) => { const percent = Math.min(100, Math.round((goal.currentAmount / goal.targetAmount) * 100)); return <button className="overview-goal" type="button" key={goal.id} onClick={() => onEditGoal(goal)}><span><strong>{goal.name}</strong><small>{money(goal.currentAmount)} of {money(goal.targetAmount)}</small></span><b>{percent}%</b><i><span style={{ width: `${percent}%` }} /></i></button>; })}</div></> : <><p className="overview-plan-empty">Give your savings a purpose and watch progress here.</p><button className="overview-plan-add" type="button" onClick={onAddGoal}><Icon name="plus" size={14} /> Add savings goal</button></>}</article>
+      <article className="panel overview-plan-card"><div className="overview-plan-card-title"><span className="overview-plan-icon account">↗</span><h3>Accounts & debts</h3></div>{accounts.length ? <><strong className={`overview-plan-value ${netWorth.netWorth < 0 ? "negative" : ""}`}>{netWorth.netWorth < 0 ? "−" : ""}{money(netWorth.netWorth)} <small>net worth</small></strong><div className="overview-plan-pair"><span>Assets <strong>{money(netWorth.assets)}</strong></span><span>Debt <strong>{money(netWorth.liabilities)}</strong></span></div><p className="overview-plan-foot">From {accounts.length} manually tracked {accounts.length === 1 ? "account" : "accounts"}</p></> : <><p className="overview-plan-empty">Add balances to see what you own and owe.</p><button className="overview-plan-add" type="button" onClick={onAddAccount}><Icon name="plus" size={14} /> Add account balance</button></>}</article>
+      <article className="panel overview-plan-card"><div className="overview-plan-card-title"><span className="overview-plan-icon recurring">↻</span><h3>Recurring costs</h3></div>{recurringItems.length ? <><strong className="overview-plan-value">{money(monthlyRecurring)} <small>per month</small></strong><p className="overview-plan-summary">Across {recurringItems.length} known {recurringItems.length === 1 ? "commitment" : "commitments"}</p>{firstRecurring && <button className="overview-recurring-item" type="button" onClick={() => onEditRecurring(firstRecurring)}><span><strong>{firstRecurring.name}</strong><small>{firstRecurring.frequency}{firstRecurring.nextDate ? ` · ${formatStatementDate(firstRecurring.nextDate)}` : ""}</small></span><Icon name="arrow" size={14} /></button>}</> : <><p className="overview-plan-empty">Keep regular bills in view before they arrive.</p><button className="overview-plan-add" type="button" onClick={onAddRecurring}><Icon name="plus" size={14} /> Add recurring cost</button></>}</article>
+    </div>
+  </section>;
+}
+
+// Render one compact dashboard metric with its context and trend.
 function MetricCard({ label, value, detail, trend, trendType, icon }: { label: string; value: string; detail: string; trend: string; trendType: string; icon: string }) {
   return <div className="metric-card"><div className={`metric-icon ${icon}`}>{icon === "wallet" ? "▰" : icon === "trend" ? "↗" : "✦"}</div><div className="metric-label">{label}</div><div className="metric-value">{value}</div><div className="metric-detail"><span className={`trend ${trendType}`}>{trendType === "positive" && "↘ "}{trend}</span> {detail}</div></div>;
 }
 
+// Plot cumulative spending against the selected month's plan.
 function SpendingChart({ month, transactions, spendingLimit }: { month: string; transactions: Transaction[]; spendingLimit: number }) {
   const [monthName, yearText] = month.split(" ");
   const monthIndex = new Date(`${monthName} 1, ${yearText}`).getMonth();
@@ -906,34 +1167,90 @@ function SpendingChart({ month, transactions, spendingLimit }: { month: string; 
   return <div className="chart"><div className="y-labels"><span>{money(maximum)}</span><span>{money(maximum * 0.66)}</span><span>{money(maximum * 0.33)}</span><span>$0</span></div><div className="chart-main"><div className="grid-lines"><i /><i /><i /><i /></div><svg viewBox="0 0 760 210" preserveAspectRatio="none" role="img" aria-label={`Cumulative spending for ${month}`}><defs><linearGradient id="area" x1="0" x2="0" y1="0" y2="1"><stop offset="0" stopColor="#9a87f7" stopOpacity=".23" /><stop offset="1" stopColor="#9a87f7" stopOpacity="0" /></linearGradient></defs><polygon points={`${spendPoints} 760,210 0,210`} fill="url(#area)" /><polyline points={spendPoints} fill="none" stroke="#9884f4" strokeWidth="3" vectorEffect="non-scaling-stroke" /><polyline points={planPoints} fill="none" stroke="#f2b866" strokeWidth="2" strokeDasharray="6 8" vectorEffect="non-scaling-stroke" /></svg><div className="x-labels">{checkpoints.map((day) => <span key={day}>{shortMonth} {day}</span>)}</div></div></div>;
 }
 
-function TransactionList({ transactions, onEdit }: { transactions: Transaction[]; onEdit?: (transaction: Transaction) => void }) {
-  return <div className="transaction-list">{transactions.length ? transactions.map((transaction) => <div className="transaction-row" key={transaction.id}><div className={`merchant-mark ${transaction.tone}`}>{transaction.initials}</div><div className="transaction-info"><strong>{transaction.merchant}{transaction.review && <span className="review-chip">Review</span>}</strong><span>{transaction.note} · {transaction.date}{transaction.originalAmount && transaction.originalCurrency ? ` · Originally ${transaction.originalCurrency} ${transaction.originalAmount.toFixed(2)}${transaction.exchangeRate ? ` at ${transaction.exchangeRate}` : ""}` : ""}</span></div><span className="transaction-category">{transaction.category}</span><strong className={transaction.amount > 0 ? "income" : "expense"}>{transaction.amount > 0 ? "+" : "−"}{money(transaction.amount)}</strong><button className="row-more" type="button" aria-label={`Edit ${transaction.merchant}`} onClick={() => onEdit?.(transaction)}><Icon name="more" size={16} /></button></div>) : <div className="empty-list">No transactions match this view.</div>}</div>;
+// Render transaction rows and an appropriate empty state.
+function TransactionList({ transactions, onEdit, emptyMessage = "No transactions to show." }: { transactions: Transaction[]; onEdit?: (transaction: Transaction) => void; emptyMessage?: string }) {
+  return <div className="transaction-list">{transactions.length ? transactions.map((transaction) => <div className="transaction-row" key={transaction.id}><div className={`merchant-mark ${transaction.tone}`}>{transaction.initials}</div><div className="transaction-info"><strong>{transaction.merchant}{transaction.review && <span className="review-chip">Review</span>}</strong><span>{transaction.note} · {transaction.date}{transaction.originalAmount && transaction.originalCurrency ? ` · Originally ${transaction.originalCurrency} ${transaction.originalAmount.toFixed(2)}${transaction.exchangeRate ? ` at ${transaction.exchangeRate}` : ""}` : ""}</span></div><span className="transaction-category">{transaction.category}</span><strong className={transaction.amount > 0 ? "income" : "expense"}>{transaction.amount > 0 ? "+" : "−"}{money(transaction.amount)}</strong><button className="row-more" type="button" aria-label={`Edit ${transaction.merchant}`} onClick={() => onEdit?.(transaction)}><Icon name="more" size={16} /></button></div>) : <div className="empty-list">{emptyMessage}</div>}</div>;
 }
 
-function TransactionsPage({ transactions, search, setSearch, categoryFilter, setCategoryFilter, onImport, onAdd, categoryOptions, onEdit, onExport }: { transactions: Transaction[]; search: string; setSearch: (value: string) => void; categoryFilter: string; setCategoryFilter: (value: string) => void; onImport: () => void; onAdd: () => void; categoryOptions: string[]; onEdit: (transaction: Transaction) => void; onExport: () => void }) {
-  return <><div className="page-heading"><div><p className="eyebrow">ACTIVITY</p><h1>Transactions</h1><p className="heading-sub">Every purchase, bill, and deposit in one place. Use the row menu to correct or delete an entry.</p></div><div className="heading-actions"><button className="secondary-button" onClick={onImport}><Icon name="upload" size={15} /> Import</button><button className="primary-button" onClick={onAdd}><Icon name="plus" size={16} /> Add transaction</button></div></div><div className="panel table-panel"><div className="table-toolbar"><div className="search-field"><Icon name="search" size={16} /><input value={search} onChange={(event) => setSearch(event.target.value)} placeholder="Search transactions" /></div><select value={categoryFilter} onChange={(event) => setCategoryFilter(event.target.value)}><option>All categories</option>{categoryOptions.map((category) => <option key={category}>{category}</option>)}</select><button className="secondary-button small" type="button" onClick={onExport}><Icon name="download" size={15} /> Export CSV</button></div><div className="table-head"><span aria-hidden="true" /><span>Merchant</span><span>Category</span><span>Amount</span><span aria-hidden="true" /></div><TransactionList transactions={transactions} onEdit={onEdit} /><div className="table-footer">Showing {transactions.length} transactions <span>Saved locally</span></div></div></>;
+// Show searchable, filterable transactions and export controls.
+function TransactionsPage({ transactions, searchRef, reviewOnly, setReviewOnly, search, setSearch, categoryFilter, setCategoryFilter, onImport, onAdd, categoryOptions, onEdit, onExport }: { transactions: Transaction[]; searchRef: RefObject<HTMLInputElement | null>; reviewOnly: boolean; setReviewOnly: (value: boolean) => void; search: string; setSearch: (value: string) => void; categoryFilter: string; setCategoryFilter: (value: string) => void; onImport: () => void; onAdd: () => void; categoryOptions: string[]; onEdit: (transaction: Transaction) => void; onExport: () => void }) {
+  return <><div className="page-heading"><div><p className="eyebrow">ACTIVITY</p><h1>Transactions</h1><p className="heading-sub">Every purchase, bill, and deposit in one place. Use the row menu to correct or delete an entry.</p></div><div className="heading-actions"><button className="secondary-button" onClick={onImport}><Icon name="upload" size={15} /> Import</button><button className="primary-button" onClick={onAdd}><Icon name="plus" size={16} /> Add transaction</button></div></div><div className="panel table-panel"><div className="table-toolbar"><div className="search-field"><Icon name="search" size={16} /><input ref={searchRef} value={search} onChange={(event) => setSearch(event.target.value)} placeholder="Search transactions" aria-label="Search transactions" /></div><select value={categoryFilter} onChange={(event) => setCategoryFilter(event.target.value)}><option>All categories</option>{categoryOptions.map((category) => <option key={category}>{category}</option>)}</select><button className={`review-filter ${reviewOnly ? "active" : ""}`} type="button" aria-pressed={reviewOnly} onClick={() => setReviewOnly(!reviewOnly)}>Needs review</button><button className="secondary-button small" type="button" onClick={onExport}><Icon name="download" size={15} /> Export CSV</button></div><div className="table-head"><span aria-hidden="true" /><span>Merchant</span><span>Category</span><span>Amount</span><span aria-hidden="true" /></div><TransactionList transactions={transactions} onEdit={onEdit} emptyMessage={reviewOnly ? "All caught up. No transactions need review." : search || categoryFilter !== "All categories" ? "No transactions match these filters." : "No transactions yet. Import a statement or add one manually."} /><div className="table-footer">Showing {transactions.length} transactions <span>Saved locally</span></div></div></>;
 }
 
-function CategoriesPage({ settings, categories, transactions, onAdd, onEdit }: { settings: BudgetSettings; categories: BudgetCategory[]; transactions: Transaction[]; onAdd: () => void; onEdit: (category: BudgetCategory) => void }) {
+// Build an SVG wedge path for one category's share of spending.
+function pieSlicePath(startAngle: number, endAngle: number) {
+  const center = 120;
+  const radius = 105;
+  const point = (angle: number) => {
+    const radians = angle * Math.PI / 180;
+    return [center + radius * Math.cos(radians), center + radius * Math.sin(radians)];
+  };
+  const [startX, startY] = point(startAngle);
+  const [endX, endY] = point(endAngle);
+  return `M ${center} ${center} L ${startX} ${startY} A ${radius} ${radius} 0 ${endAngle - startAngle > 180 ? 1 : 0} 1 ${endX} ${endY} Z`;
+}
+
+// Show category spending as an interactive pie and editable limit list.
+function CategoriesPage({ month, monthOptions, setMonth, settings, categories, transactions, onAdd, onEdit }: { month: string; monthOptions: string[]; setMonth: (value: string) => void; settings: BudgetSettings; categories: BudgetCategory[]; transactions: Transaction[]; onAdd: () => void; onEdit: (category: BudgetCategory) => void }) {
   const spending = calculateCategorySpending(categories, transactions);
-  const cards = categories.map((category) => ({ ...category, amount: spending[category.name] ?? 0 }));
-  const totalPlanned = categories.reduce((total, category) => total + category.limit, 0);
-  const totalSpent = cards.reduce((total, category) => total + category.amount, 0);
-  const housing = cards.find((category) => category.name === "Housing");
+  const items = categories.map((category) => ({ ...category, amount: spending[category.name] ?? 0 }))
+    .sort((a, b) => b.amount - a.amount || a.name.localeCompare(b.name));
+  const spentItems = items.filter((category) => category.amount > 0);
+  const totalPlanned = items.reduce((total, category) => total + category.limit, 0);
+  const totalSpent = items.reduce((total, category) => total + category.amount, 0);
+  const housing = items.find((category) => category.name === "Housing");
   const flexibleLimit = Math.max(0, totalPlanned - (housing?.limit ?? 0));
   const flexibleSpent = Math.max(0, totalSpent - (housing?.amount ?? 0));
   const planDifference = settings.spendingLimit - totalPlanned;
-  const attentionCount = cards.filter((category) => category.limit === 0 ? category.amount > 0 : category.amount / category.limit >= 0.8).length;
-  const plannedPercent = settings.spendingLimit ? Math.round((totalPlanned / settings.spendingLimit) * 100) : 0;
-  const flexiblePercent = flexibleLimit ? Math.round((flexibleSpent / flexibleLimit) * 100) : 0;
+  const attentionCount = items.filter((category) => category.limit === 0 ? category.amount > 0 : category.amount / category.limit >= 0.8).length;
+  const slices = spentItems.map((category, index) => {
+    const spentBefore = spentItems.slice(0, index).reduce((total, item) => total + item.amount, 0);
+    const startAngle = -90 + spentBefore / totalSpent * 360;
+    const endAngle = -90 + (spentBefore + category.amount) / totalSpent * 360;
+    return { category, path: pieSlicePath(startAngle, endAngle) };
+  });
+  const openSlice = (event: React.KeyboardEvent<SVGElement>, category: BudgetCategory) => {
+    if (event.key === "Enter" || event.key === " ") {
+      event.preventDefault();
+      onEdit(category);
+    }
+  };
 
-  return <><div className="page-heading"><div><p className="eyebrow">YOUR PLAN</p><h1>Categories</h1><p className="heading-sub">Set monthly limits and see actual spending from {transactions.length} transactions.</p></div><button className="secondary-button" onClick={onAdd}><Icon name="plus" size={16} /> Add custom category</button></div><div className="category-summary"><div className="panel category-total"><span>Total planned</span><strong>{money(totalPlanned)}</strong><div className="mini-progress"><i style={{ width: `${Math.min(100, plannedPercent)}%` }} /></div><small>{planDifference >= 0 ? `${money(planDifference)} unassigned from ${money(settings.spendingLimit)}` : `${money(planDifference)} over your ${money(settings.spendingLimit)} plan`}</small></div><div className="panel category-total"><span>Flexible categories</span><strong>{money(flexibleLimit)}</strong><div className="mini-progress blue"><i style={{ width: `${Math.min(100, flexiblePercent)}%` }} /></div><small>{money(flexibleSpent)} spent outside Housing</small></div><div className="panel category-total"><span>Needs attention</span><strong>{attentionCount}</strong><div className={attentionCount ? "attention-copy" : "attention-copy calm"}>{attentionCount ? "At or above 80% of their limits" : "Every category still has room"}</div></div></div><div className="category-cards">{cards.map((category) => {
-    const percent = category.limit ? Math.round((category.amount / category.limit) * 100) : category.amount > 0 ? 100 : 0;
-    const remaining = category.limit - category.amount;
-    return <div className="panel category-card" key={category.id}><div className="category-card-top"><span className="category-icon" style={{ background: `${category.color}33`, color: category.color }}>{category.icon}</span><button className="category-edit-button" onClick={() => onEdit(category)}>Edit limit</button></div><div className="category-title"><h3>{category.name}</h3>{category.custom && <span>Custom</span>}</div><div className="category-amount"><strong>{money(category.amount)}</strong><span>of {money(category.limit)}</span></div><div className="progress-track"><i style={{ width: `${Math.min(100, percent)}%`, background: category.color }} /></div><div className="category-card-foot"><span>{percent}% used</span><span className={remaining < 0 ? "over-limit" : ""}>{remaining >= 0 ? `${money(remaining)} left` : `${money(remaining)} over`}</span></div></div>;
-  })}</div></>;
+  return <>
+    <div className="page-heading"><div><p className="eyebrow">YOUR PLAN</p><h1>Categories</h1><p className="heading-sub">See where your money went in {month}. Select a slice or category to change its limit.</p></div><div className="heading-actions"><MonthPicker month={month} options={monthOptions} onChange={setMonth} /><button className="secondary-button" onClick={onAdd}><Icon name="plus" size={16} /> Add custom category</button></div></div>
+    <div className="category-at-a-glance">
+      <div><span>Spent this month</span><strong>{money(totalSpent)}</strong><small>Across {transactions.length} transactions</small></div>
+      <div><span>Total planned</span><strong>{money(totalPlanned)}</strong><small>{planDifference >= 0 ? `${money(planDifference)} unassigned` : `${money(planDifference)} over your plan`}</small></div>
+      <div><span>Flexible spending</span><strong>{money(flexibleSpent)}</strong><small>of {money(flexibleLimit)} outside Housing</small></div>
+      <div><span>Needs attention</span><strong>{attentionCount}</strong><small>{attentionCount ? "At least 80% of the limit used" : "All categories have room"}</small></div>
+    </div>
+    <section className="panel category-breakdown" aria-labelledby="category-breakdown-heading">
+      <div className="category-breakdown-heading"><div><h2 id="category-breakdown-heading">Spending by category</h2><p>Each slice shows a share of this month’s spending.</p></div><span>{spentItems.length} active of {items.length} categories</span></div>
+      <div className="category-breakdown-layout">
+        <div className="category-pie-panel">
+          <svg className="category-pie" viewBox="0 0 240 240" role="group" aria-label="Spending pie chart. Select a slice to edit its category limit.">
+            {slices.length === 0 && <circle cx="120" cy="120" r="105" fill="#f0edeb" />}
+            {slices.length === 1 ? <circle className="pie-slice" cx="120" cy="120" r="105" fill={slices[0].category.color} stroke="#fff" strokeWidth="2" role="button" tabIndex={0} aria-label={`${slices[0].category.name}: ${money(slices[0].category.amount)} spent. Edit limit.`} onClick={() => onEdit(slices[0].category)} onKeyDown={(event) => openSlice(event, slices[0].category)} /> : slices.map(({ category, path }) => <path className="pie-slice" key={category.id} d={path} fill={category.color} stroke="#fff" strokeWidth="2" role="button" tabIndex={0} aria-label={`${category.name}: ${money(category.amount)} spent, ${Math.round(category.amount / totalSpent * 100)}% of spending. Edit limit.`} onClick={() => onEdit(category)} onKeyDown={(event) => openSlice(event, category)} />)}
+          </svg>
+          <div className="category-pie-caption"><span>Total spending</span><strong>{money(totalSpent)}</strong>{!totalSpent && <small>Add a transaction to see the breakdown.</small>}</div>
+        </div>
+        <div className="category-breakdown-list" aria-label="Categories and limits">
+          {items.map((category) => {
+            const limitUsed = category.limit ? Math.round(category.amount / category.limit * 100) : category.amount > 0 ? 100 : 0;
+            const share = totalSpent ? Math.round(category.amount / totalSpent * 100) : 0;
+            return <button className="category-breakdown-row" key={category.id} type="button" onClick={() => onEdit(category)} aria-label={`Edit ${category.name} limit. ${money(category.amount)} spent of ${money(category.limit)} limit.`}>
+              <span className="category-breakdown-dot" style={{ background: category.color }} />
+              <span className="category-breakdown-name"><strong>{category.name}</strong><small>{money(category.amount)} spent · {money(category.limit)} limit</small></span>
+              <span className="category-breakdown-share"><strong>{share}%</strong><small className={limitUsed >= 80 && category.amount > 0 ? "near-limit" : ""}>{limitUsed}% of limit</small></span>
+            </button>;
+          })}
+        </div>
+      </div>
+    </section>
+  </>;
 }
 
+// Show account balances, savings goals, and recurring commitments.
 function PlanPage({ accounts, goals, recurringItems, onAddAccount, onEditAccount, onAddGoal, onEditGoal, onAddRecurring, onEditRecurring }: { accounts: FinancialAccount[]; goals: SavingsGoal[]; recurringItems: RecurringItem[]; onAddAccount: () => void; onEditAccount: (account: FinancialAccount) => void; onAddGoal: () => void; onEditGoal: (goal: SavingsGoal) => void; onAddRecurring: () => void; onEditRecurring: (item: RecurringItem) => void }) {
   const totals = calculateNetWorth(accounts);
   const monthlyRecurring = calculateMonthlyRecurringTotal(recurringItems);
@@ -950,11 +1267,13 @@ function PlanPage({ accounts, goals, recurringItems, onAddAccount, onEditAccount
   </>;
 }
 
+// Render an empty planner section with its first action.
 function PlannerEmpty({ title, copy, action, onAction }: { title: string; copy: string; action: string; onAction: () => void }) {
   return <div className="planner-empty"><span>✦</span><strong>{title}</strong><p>{copy}</p><button className="secondary-button small" type="button" onClick={onAction}>{action}</button></div>;
 }
 
-function ReportsPage({ transactions, settings, categories, accounts, goals, recurringItems, month, onDownload, onOpenPlan }: { transactions: Transaction[]; settings: BudgetSettings; categories: BudgetCategory[]; accounts: FinancialAccount[]; goals: SavingsGoal[]; recurringItems: RecurringItem[]; month: string; onDownload: () => void; onOpenPlan: () => void }) {
+// Calculate and present deeper financial metrics for the selected month.
+function ReportsPage({ transactions, settings, categories, accounts, goals, recurringItems, month, monthOptions, setMonth, onDownload, onOpenPlan }: { transactions: Transaction[]; settings: BudgetSettings; categories: BudgetCategory[]; accounts: FinancialAccount[]; goals: SavingsGoal[]; recurringItems: RecurringItem[]; month: string; monthOptions: string[]; setMonth: (value: string) => void; onDownload: () => void; onOpenPlan: () => void }) {
   const health = calculateFinancialHealth({ monthlyIncome: settings.monthlyIncome, spendingLimit: settings.spendingLimit, transactions, accounts });
   const netWorth = calculateNetWorth(accounts);
   const recurringTotal = calculateMonthlyRecurringTotal(recurringItems);
@@ -968,11 +1287,11 @@ function ReportsPage({ transactions, settings, categories, accounts, goals, recu
     .slice(0, 5);
   const biggestCategory = categoryRows.find((category) => category.spent > 0);
   const fundedGoals = goals.filter((goal) => goal.currentAmount >= goal.targetAmount).length;
-  const healthLabel = health.score >= 75 ? "Your plan has a solid foundation." : health.score >= 55 ? "Your plan is steady, with room to strengthen." : "A few focused changes would improve your buffer.";
+  const healthLabel = !transactions.length ? `No activity recorded for ${month} yet.` : health.score >= 75 ? "Your plan has a solid foundation." : health.score >= 55 ? "Your plan is steady, with room to strengthen." : "A few focused changes would improve your buffer.";
 
-  return <><div className="page-heading"><div><p className="eyebrow">THE BIGGER PICTURE</p><h1>Financial reports</h1><p className="heading-sub">Live calculations from {month}; transfers are excluded from spending.</p></div><button className="secondary-button" onClick={onDownload}><Icon name="download" size={15} /> Download report</button></div>
+  return <><div className="page-heading"><div><p className="eyebrow">THE BIGGER PICTURE</p><h1>Financial reports</h1><p className="heading-sub">Live calculations from {month}; transfers are excluded from spending.</p></div><div className="heading-actions"><MonthPicker month={month} options={monthOptions} onChange={setMonth} /><button className="secondary-button" onClick={onDownload}><Icon name="download" size={15} /> Download report</button></div></div>
     <div className="metric-grid"><MetricCard label="Monthly spending" value={money(health.monthlyExpenses)} detail={`of ${money(settings.spendingLimit)} plan`} trend={`${settings.spendingLimit ? Math.round((health.monthlyExpenses / settings.spendingLimit) * 100) : 0}% used`} trendType={remaining >= 0 ? "neutral" : "warning"} icon="trend" /><MetricCard label="Remaining to spend" value={`${remaining < 0 ? "−" : ""}${money(remaining)}`} detail="Based on your spending limit" trend={remaining >= 0 ? "Available" : "Over plan"} trendType={remaining >= 0 ? "positive" : "warning"} icon="wallet" /><MetricCard label="Net worth" value={`${netWorth.netWorth < 0 ? "−" : ""}${money(netWorth.netWorth)}`} detail={`${money(netWorth.assets)} assets · ${money(netWorth.liabilities)} debt`} trend={accounts.length ? "Current snapshot" : "Add balances"} trendType="neutral" icon="forecast" /><MetricCard label="Recurring commitments" value={money(recurringTotal)} detail={`${recurringItems.length} known recurring items`} trend="Monthly equivalent" trendType="neutral" icon="leaf" /></div>
-    <div className="report-grid"><div className="panel report-highlight"><div className="report-kicker">{month.toUpperCase()} SIGNAL</div><h2>{healthLabel}</h2><p>{health.message} Your current baseline leaves <strong>{remaining >= 0 ? money(remaining) : `${money(remaining)} over plan`}</strong> before month end.</p><div className="report-number"><strong>{health.score}/100</strong><span>{health.status} financial-health score · {health.savingsRate.toFixed(1)}% current savings rate</span></div></div><div className="panel report-bars"><div className="panel-heading"><div><h2>Category budget use</h2><p>Actual spending versus your limits</p></div></div>{categoryRows.map((category) => { const percent = category.limit ? Math.round((category.spent / category.limit) * 100) : category.spent > 0 ? 100 : 0; return <div className="bar-row" key={category.id}><span>{category.name}</span><div><i style={{ width: `${Math.min(100, percent)}%`, background: category.color }} /></div><strong className={percent > 100 ? "over-limit" : ""}>{percent}%</strong></div>; })}</div></div>
-    <div className="panel insight-list"><div className="panel-heading"><div><h2>Helpful nudges</h2><p>Specific observations from the data you have entered</p></div></div><div className="insight"><span className="insight-icon mint">✦</span><div><strong>{reviewCount ? `${reviewCount} imported ${reviewCount === 1 ? "transaction needs" : "transactions need"} review` : "Imported transactions are categorized"}</strong><p>{reviewCount ? "Confirming merchants and categories keeps forecasts and reports accurate." : "Nothing in this month is currently flagged for category review."}</p></div></div><div className="insight"><span className="insight-icon peach">↘</span><div><strong>{biggestCategory ? `${biggestCategory.name} is your largest spending category` : "Add transactions to reveal spending patterns"}</strong><p>{biggestCategory ? `${money(biggestCategory.spent)} spent against a ${money(biggestCategory.limit)} monthly category limit.` : "Your category report will update as soon as statement or manual entries are added."}</p></div></div><button className="insight insight-button" type="button" onClick={onOpenPlan}><span className="insight-icon purple">⌁</span><div><strong>{accounts.length ? `${health.emergencyMonths ?? 0} months of essential expenses in cash accounts` : "Add balances for net worth and emergency coverage"}</strong><p>{accounts.length ? "Canadian guidance commonly uses three to six months as an emergency-fund range." : "Pocketwise cannot assess your financial buffer from transactions alone."}</p></div><Icon name="arrow" size={16} /></button><div className="insight"><span className="insight-icon mint">◎</span><div><strong>{goals.length ? `${fundedGoals} of ${goals.length} savings goals funded` : "Turn future expenses into savings goals"}</strong><p>{goals.length ? "Update saved amounts as you contribute so your monthly pace stays useful." : "An emergency fund or planned purchase is a good first goal."}</p></div></div></div>
+    <div className="report-grid"><div className="panel report-highlight"><div className="report-kicker">{month.toUpperCase()} SIGNAL</div><h2>{healthLabel}</h2><p>{transactions.length ? <>{health.message} Your current baseline leaves <strong>{remaining >= 0 ? money(remaining) : `${money(remaining)} over plan`}</strong> before month end.</> : "Import a statement or add a transaction to see insights for this month."}</p><div className="report-number"><strong>{transactions.length ? `${health.score}/100` : "—"}</strong><span>{transactions.length ? `${health.status} financial-health score · ${health.savingsRate.toFixed(1)}% current savings rate` : "Your report will appear as spending is added"}</span></div></div><div className="panel report-bars"><div className="panel-heading"><div><h2>Category budget use</h2><p>Actual spending versus your limits</p></div></div>{categoryRows.map((category) => { const percent = category.limit ? Math.round((category.spent / category.limit) * 100) : category.spent > 0 ? 100 : 0; return <div className="bar-row" key={category.id}><span>{category.name}</span><div><i style={{ width: `${Math.min(100, percent)}%`, background: category.color }} /></div><strong className={percent > 100 ? "over-limit" : ""}>{percent}%</strong></div>; })}</div></div>
+    <div className="panel insight-list"><div className="panel-heading"><div><h2>Helpful nudges</h2><p>Specific observations from the data you have entered</p></div></div><div className="insight"><span className="insight-icon mint">✦</span><div><strong>{reviewCount ? `${reviewCount} imported ${reviewCount === 1 ? "transaction needs" : "transactions need"} review` : transactions.length ? "Imported transactions are categorized" : "No transactions to review yet"}</strong><p>{reviewCount ? "Confirming merchants and categories keeps forecasts and reports accurate." : "Nothing in this month is currently flagged for category review."}</p></div></div><div className="insight"><span className="insight-icon peach">↘</span><div><strong>{biggestCategory ? `${biggestCategory.name} is your largest spending category` : "Add transactions to reveal spending patterns"}</strong><p>{biggestCategory ? `${money(biggestCategory.spent)} spent against a ${money(biggestCategory.limit)} monthly category limit.` : "Your category report will update as soon as statement or manual entries are added."}</p></div></div><button className="insight insight-button" type="button" onClick={onOpenPlan}><span className="insight-icon purple">⌁</span><div><strong>{accounts.length ? `${health.emergencyMonths ?? 0} months of essential expenses in cash accounts` : "Add balances for net worth and emergency coverage"}</strong><p>{accounts.length ? "Canadian guidance commonly uses three to six months as an emergency-fund range." : "Pocketwise cannot assess your financial buffer from transactions alone."}</p></div><Icon name="arrow" size={16} /></button><div className="insight"><span className="insight-icon mint">◎</span><div><strong>{goals.length ? `${fundedGoals} of ${goals.length} savings goals funded` : "Turn future expenses into savings goals"}</strong><p>{goals.length ? "Update saved amounts as you contribute so your monthly pace stays useful." : "An emergency fund or planned purchase is a good first goal."}</p></div></div></div>
   </>;
 }

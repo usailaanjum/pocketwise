@@ -4,6 +4,7 @@ import test from "node:test";
 import { parseStatementLines, supportedInstitutions } from "../lib/statement-parser/core.ts";
 import type { StatementLine, TextFragment } from "../lib/statement-parser/core.ts";
 
+// Build a positioned text line that resembles PDF extraction output.
 function line(text: string, y: number, items?: TextFragment[], page = 1): StatementLine {
   return {
     text,

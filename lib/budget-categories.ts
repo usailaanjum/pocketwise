@@ -33,10 +33,12 @@ export const customCategoryColors = [
   "#df7f76",
 ] as const;
 
+// Round category limits and totals to cents.
 function currencyAmount(value: number) {
   return Math.round(value * 100) / 100;
 }
 
+// Split a spending limit across the built-in category percentages.
 export function createDefaultCategories(spendingLimit: number): BudgetCategory[] {
   const safeLimit = Math.max(0, Number.isFinite(spendingLimit) ? spendingLimit : 0);
   let allocated = 0;
@@ -56,6 +58,14 @@ export function createDefaultCategories(spendingLimit: number): BudgetCategory[]
   });
 }
 
+// Detect edits so a later budget change does not overwrite custom limits.
+export function hasCustomCategoryPlan(categories: BudgetCategory[], spendingLimit: number): boolean {
+  const defaults = createDefaultCategories(spendingLimit);
+  return categories.length !== defaults.length || categories.some((category, index) =>
+    category.id !== defaults[index].id || category.limit !== defaults[index].limit || category.custom);
+}
+
+// Validate a category loaded from storage or a backup.
 export function isBudgetCategory(value: unknown): value is BudgetCategory {
   if (!value || typeof value !== "object") return false;
   const candidate = value as Partial<BudgetCategory>;
@@ -70,6 +80,7 @@ export function isBudgetCategory(value: unknown): value is BudgetCategory {
     && typeof candidate.custom === "boolean";
 }
 
+// Sum expense amounts per category, sending unknown categories to Other.
 export function calculateCategorySpending(
   categories: BudgetCategory[],
   transactions: CategorizedAmount[],
@@ -78,7 +89,7 @@ export function calculateCategorySpending(
   const categoryNames = new Set(categories.map((category) => category.name));
   const fallback = categoryNames.has("Other") ? "Other" : undefined;
   for (const transaction of transactions) {
-    if (transaction.amount >= 0) continue;
+    if (transaction.amount >= 0 || transaction.category === "Payments & transfers") continue;
     const category = categoryNames.has(transaction.category) ? transaction.category : fallback;
     if (!category) continue;
     spending[category] = currencyAmount((spending[category] ?? 0) + Math.abs(transaction.amount));

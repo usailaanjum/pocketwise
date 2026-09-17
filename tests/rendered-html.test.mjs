@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import test from "node:test";
 
+// Render the built Worker route in memory for server-side smoke tests.
 async function render() {
   const workerUrl = new URL("../dist/server/index.js", import.meta.url);
   workerUrl.searchParams.set("test", `${process.pid}-${Date.now()}`);
@@ -27,15 +28,19 @@ test("server-renders the Pocketwise dashboard", async () => {
   assert.doesNotMatch(html, /codex-preview|SkeletonPreview|react-loading-skeleton/i);
 });
 
-test("keeps the MVP workflow and local-storage contract in source", async () => {
-  const [page, layout, packageJson, prd] = await Promise.all([
+test("keeps the MVP workflow and IndexedDB persistence in source", async () => {
+  const [page, storage, layout, packageJson, prd] = await Promise.all([
     readFile(new URL("../app/page.tsx", import.meta.url), "utf8"),
+    readFile(new URL("../lib/local-database.ts", import.meta.url), "utf8"),
     readFile(new URL("../app/layout.tsx", import.meta.url), "utf8"),
     readFile(new URL("../package.json", import.meta.url), "utf8"),
     readFile(new URL("../docs/PRODUCT_REQUIREMENTS.md", import.meta.url), "utf8"),
   ]);
 
-  assert.match(page, /localStorage\.setItem/);
+  assert.match(page, /saveImportedStatement/);
+  assert.match(storage, /indexedDB\.open/);
+  assert.match(storage, /STATEMENT_FILES_STORE/);
+  assert.match(storage, /database\.transaction\(\[WORKSPACE_STORE, STATEMENTS_STORE, STATEMENT_FILES_STORE\]/);
   assert.match(page, /monthlyIncome/);
   assert.match(page, /spendingLimit/);
   assert.match(page, /originalCurrency/);

@@ -21,6 +21,7 @@ export const metadata: Metadata = {
   },
 };
 
+// Apply the app's font variables and document metadata to every page.
 export default function RootLayout({
   children,
 }: Readonly<{

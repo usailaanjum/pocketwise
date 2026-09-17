@@ -62,23 +62,28 @@ const transferCategory = "Payments & transfers";
 const essentialCategories = new Set(["Housing", "Groceries", "Utilities", "Transportation", "Health"]);
 const cashAccountTypes = new Set<AccountType>(["Chequing", "Savings", "Cash"]);
 
+// Keep a score inside the requested range.
 function clamp(value: number, minimum = 0, maximum = 100) {
   return Math.min(maximum, Math.max(minimum, value));
 }
 
+// Round calculated money values to cents.
 function roundCurrency(value: number) {
   return Math.round(value * 100) / 100;
 }
 
+// Normalize transaction text before comparing imports for duplicates.
 function normalizeText(value: string) {
   return value.toLowerCase().replace(/[^a-z0-9]+/g, " ").trim();
 }
 
+// Build a stable date, merchant, and amount key for one transaction.
 export function transactionFingerprint(transaction: TransactionLike) {
   const date = transaction.postingDate || transaction.date;
   return [normalizeText(date), normalizeText(transaction.merchant), Math.round(transaction.amount * 100)].join("|");
 }
 
+// Skip only as many matching imports as already exist in the workspace.
 export function excludeExistingTransactions<T extends TransactionLike>(existing: TransactionLike[], candidates: T[]) {
   const existingCounts = new Map<string, number>();
   for (const transaction of existing) {
@@ -102,6 +107,7 @@ export function excludeExistingTransactions<T extends TransactionLike>(existing:
   return { unique, duplicateCount };
 }
 
+// Add assets and liabilities separately, then subtract debt from assets.
 export function calculateNetWorth(accounts: FinancialAccount[]) {
   const assets = roundCurrency(accounts
     .filter((account) => account.kind === "asset")
@@ -112,6 +118,7 @@ export function calculateNetWorth(accounts: FinancialAccount[]) {
   return { assets, liabilities, netWorth: roundCurrency(assets - liabilities) };
 }
 
+// Convert a recurring payment frequency into its monthly cost.
 export function monthlyEquivalent(amount: number, frequency: RecurringFrequency) {
   const multiplier = frequency === "Weekly"
     ? 52 / 12
@@ -123,10 +130,12 @@ export function monthlyEquivalent(amount: number, frequency: RecurringFrequency)
   return roundCurrency(Math.max(0, amount) * multiplier);
 }
 
+// Add the monthly equivalents of all recurring commitments.
 export function calculateMonthlyRecurringTotal(items: RecurringItem[]) {
   return roundCurrency(items.reduce((total, item) => total + monthlyEquivalent(item.amount, item.frequency), 0));
 }
 
+// Divide a goal's remaining balance across the months until its target date.
 export function suggestedMonthlyContribution(goal: SavingsGoal, today = new Date()) {
   const remaining = Math.max(0, goal.targetAmount - goal.currentAmount);
   if (!goal.targetDate || remaining === 0) return 0;
@@ -139,6 +148,7 @@ export function suggestedMonthlyContribution(goal: SavingsGoal, today = new Date
   return roundCurrency(remaining / months);
 }
 
+// Score cash flow, plan usage, and optional emergency savings for a month.
 export function calculateFinancialHealth({
   monthlyIncome,
   spendingLimit,
@@ -195,6 +205,7 @@ export function calculateFinancialHealth({
   };
 }
 
+// Validate an account read from storage or a backup.
 export function isFinancialAccount(value: unknown): value is FinancialAccount {
   if (!value || typeof value !== "object") return false;
   const candidate = value as Partial<FinancialAccount>;
@@ -207,6 +218,7 @@ export function isFinancialAccount(value: unknown): value is FinancialAccount {
     && candidate.balance >= 0;
 }
 
+// Validate a savings goal read from storage or a backup.
 export function isSavingsGoal(value: unknown): value is SavingsGoal {
   if (!value || typeof value !== "object") return false;
   const candidate = value as Partial<SavingsGoal>;
@@ -219,6 +231,7 @@ export function isSavingsGoal(value: unknown): value is SavingsGoal {
     && typeof candidate.targetDate === "string";
 }
 
+// Validate a recurring item read from storage or a backup.
 export function isRecurringItem(value: unknown): value is RecurringItem {
   if (!value || typeof value !== "object") return false;
   const candidate = value as Partial<RecurringItem>;

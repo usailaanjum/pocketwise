@@ -18,6 +18,7 @@ const SIGN_IN_PATH = "/signin-with-chatgpt";
 const SIGN_OUT_PATH = "/signout-with-chatgpt";
 const CALLBACK_PATH = "/callback";
 
+// Read trusted authentication headers and return the current ChatGPT user.
 export async function getChatGPTUser(): Promise<ChatGPTUser | null> {
   const requestHeaders = await headers();
   const userId = requestHeaders.get(USER_ID_HEADER);
@@ -39,6 +40,7 @@ export async function getChatGPTUser(): Promise<ChatGPTUser | null> {
   };
 }
 
+// Require a signed-in user or redirect back through ChatGPT sign-in.
 export async function requireChatGPTUser(
   returnTo: string,
 ): Promise<ChatGPTUser> {
@@ -48,16 +50,19 @@ export async function requireChatGPTUser(
   redirect(chatGPTSignInPath(returnTo));
 }
 
+// Build a sign-in URL with a validated local return path.
 export function chatGPTSignInPath(returnTo: string): string {
   const safeReturnTo = safeRelativeReturnPath(returnTo);
   return `${SIGN_IN_PATH}?return_to=${encodeURIComponent(safeReturnTo)}`;
 }
 
+// Build a sign-out URL with a validated local return path.
 export function chatGPTSignOutPath(returnTo = "/"): string {
   const safeReturnTo = safeRelativeReturnPath(returnTo);
   return `${SIGN_OUT_PATH}?return_to=${encodeURIComponent(safeReturnTo)}`;
 }
 
+// Reject external or reserved authentication return destinations.
 function safeRelativeReturnPath(value: string): string {
   if (!value.startsWith("/") || value.startsWith("//")) return "/";
 
@@ -73,6 +78,7 @@ function safeRelativeReturnPath(value: string): string {
   return `${url.pathname}${url.search}${url.hash}`;
 }
 
+// Prevent authentication redirects from looping through auth endpoints.
 function isReservedAuthPath(pathname: string): boolean {
   return (
     pathname === SIGN_IN_PATH ||
@@ -81,6 +87,7 @@ function isReservedAuthPath(pathname: string): boolean {
   );
 }
 
+// Decode optional name headers without crashing on malformed encoding.
 function safeDecodeURIComponent(value: string): string | null {
   try {
     return decodeURIComponent(value);

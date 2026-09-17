@@ -12,6 +12,7 @@ type PdfTextItem = {
 type PositionedFragment = TextFragment & { y: number };
 
 export class StatementPdfError extends Error {
+// Attach a machine-readable reason to a user-facing PDF error.
   constructor(
     message: string,
     readonly code: "file-too-large" | "image-only" | "invalid-pdf",
@@ -21,6 +22,7 @@ export class StatementPdfError extends Error {
   }
 }
 
+// Keep only PDF.js text items with usable text and position data.
 function isPdfTextItem(item: unknown): item is PdfTextItem {
   if (!item || typeof item !== "object") return false;
   const candidate = item as Partial<PdfTextItem>;
@@ -30,10 +32,12 @@ function isPdfTextItem(item: unknown): item is PdfTextItem {
     && typeof candidate.width === "number";
 }
 
+// Reduce tiny PDF coordinate differences before grouping text.
 function roundCoordinate(value: number) {
   return Math.round(value * 100) / 100;
 }
 
+// Group positioned PDF fragments into reading-order lines.
 export function groupPdfTextItems(items: unknown[], page: number): StatementLine[] {
   const fragments: PositionedFragment[] = items
     .filter(isPdfTextItem)
@@ -69,6 +73,7 @@ export function groupPdfTextItems(items: unknown[], page: number): StatementLine
     });
 }
 
+// Read every PDF page and reject scans that contain too little selectable text.
 export async function extractPdfLines(data: ArrayBuffer): Promise<StatementLine[]> {
   let pdfjs: typeof import("pdfjs-dist");
   try {
@@ -106,6 +111,7 @@ export async function extractPdfLines(data: ArrayBuffer): Promise<StatementLine[
   }
 }
 
+// Enforce the upload size limit, extract text, and parse its transactions.
 export async function parsePdfStatement(file: File): Promise<StatementParseResult> {
   if (file.size > 10 * 1024 * 1024) {
     throw new StatementPdfError("Choose a PDF smaller than 10 MB.", "file-too-large");

@@ -33,6 +33,7 @@ const localBindingConfig = {
     : [],
 };
 
+// Configure local Cloudflare bindings and the plugins used to build the app.
 export default defineConfig(async () => {
   // Keep Wrangler and Miniflare state project-local. These are non-secret tool
   // settings; application environment belongs in ignored `.env*` files.

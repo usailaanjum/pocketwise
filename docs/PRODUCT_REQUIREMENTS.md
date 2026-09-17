@@ -49,7 +49,7 @@ Pocketwise helps an individual understand spending and anticipate future costs w
 - CSV imports preserve original amount, original currency, and exchange rate when matching columns exist.
 - Imported purchases reduce available spending; card payments are shown as transfers rather than new spending.
 - The dashboard forecast changes when transactions or budget settings change.
-- Category cards calculate spent amounts from the selected month’s transactions rather than placeholder values.
+- The category pie and list calculate spent amounts from the selected month’s transactions rather than placeholder values.
 - A user can edit any category limit and create a custom category with a name and monthly CAD limit.
 - Custom categories appear in transaction entry and filtering immediately.
 - The Settings action reopens the monthly baseline form.
@@ -93,7 +93,7 @@ Public bank guidance establishes a common transaction core but does not guarante
 | Feature | Stage | Notes |
 | --- | --- | --- |
 | Local budget setup | MVP | Monthly income, spending limit, CAD |
-| Local transaction persistence | MVP | Browser-only; no account required |
+| Local transaction persistence | MVP | IndexedDB in the current browser; existing localStorage data migrates on first load |
 | Manual transaction entry | MVP | Merchant, amount, category, note |
 | CSV statement import | MVP | Flexible common-column mapping |
 | Multi-institution PDF import | MVP | Content detection plus conservative card/account row parsers |
@@ -111,7 +111,8 @@ Public bank guidance establishes a common transaction core but does not guarante
 | CSV column-mapping screen | Next | User can correct unfamiliar headers before import |
 | Saved user account | Future | Authentication and encrypted durable storage |
 | Cross-device sync | Future | User-controlled backup and restore |
-| File history | Future | Track source statement, import date, and duplicate status |
+| Original statement storage | MVP | Store accepted CSV/PDF files separately from parsed transactions; download originals from Settings |
+| File history | Future | Add richer source history and duplicate status |
 | Advanced forecasting | Future | Multiple months, seasonality, pay cycles, and known bills |
 | Multi-currency budgets | Future | Base-currency selection and historical FX handling |
 | Bank connections | Future | Optional and explicitly consented; not required for core use |

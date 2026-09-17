@@ -141,6 +141,7 @@ const moneyOnly = new RegExp(`^${moneyToken}$`, "i");
 const twoDateRow = new RegExp(`^(${rowDateToken})\\s+(${rowDateToken})\\s+(.+?)\\s+(${moneyToken})(?=\\s|$)`, "i");
 const oneDateRow = new RegExp(`^(${rowDateToken})\\s+(.+?)\\s+(${moneyToken})(?=\\s|$)`, "i");
 
+// Remove accents and extra spaces so statement text matches consistently.
 function normalizedText(value: string) {
   return value
     .normalize("NFD")
@@ -149,6 +150,7 @@ function normalizedText(value: string) {
     .trim();
 }
 
+// Read a printed amount, including parentheses or CR markers for credits.
 function parseMoney(value: string) {
   const normalized = value.trim();
   const negative = normalized.startsWith("-")
@@ -159,11 +161,13 @@ function parseMoney(value: string) {
   return negative ? -amount : amount;
 }
 
+// Count a bank identifier without letting repeated logos dominate detection.
 function countMatches(text: string, pattern: RegExp) {
   const flags = pattern.flags.includes("g") ? pattern.flags : `${pattern.flags}g`;
   return Math.min(4, Array.from(text.matchAll(new RegExp(pattern.source, flags))).length);
 }
 
+// Choose the institution whose identifying phrases appear most often.
 function detectInstitution(text: string) {
   let best = { id: "unknown" as InstitutionId, name: "Unknown institution", score: 0 };
   for (const rule of institutionRules) {
@@ -173,6 +177,7 @@ function detectInstitution(text: string) {
   return best;
 }
 
+// Distinguish deposit statements from credit card statements by their headings.
 function detectAccountKind(text: string): AccountKind {
   const depositSignals = [
     /DETAILS OF YOUR ACCOUNT ACTIVITY/i,
@@ -194,6 +199,7 @@ function detectAccountKind(text: string): AccountKind {
   return depositScore >= cardScore && depositScore > 0 ? "deposit-account" : "credit-card";
 }
 
+// Reject impossible calendar dates instead of letting JavaScript roll them over.
 function validDate(year: number, month: number, day: number) {
   const date = new Date(year, month, day);
   return date.getFullYear() === year && date.getMonth() === month && date.getDate() === day
@@ -201,6 +207,7 @@ function validDate(year: number, month: number, day: number) {
     : undefined;
 }
 
+// Parse statement dates that include a year in common English, French, and numeric forms.
 function parseExplicitDate(value: string) {
   const clean = normalizedText(value).replace(/,/g, "").replace(/\./g, "").toUpperCase();
   const iso = clean.match(/^(\d{4})-(\d{1,2})-(\d{1,2})$/);
@@ -223,6 +230,7 @@ function parseExplicitDate(value: string) {
   return undefined;
 }
 
+// Use the latest full date on the statement to infer years on shorter row dates.
 function findReferenceDate(text: string) {
   const candidates = Array.from(text.matchAll(fullDateRegex))
     .map((match) => parseExplicitDate(match[0]))
@@ -230,6 +238,7 @@ function findReferenceDate(text: string) {
   return candidates.sort((a, b) => b.getTime() - a.getTime())[0] ?? new Date();
 }
 
+// Resolve a row date, including year rollover near a statement boundary.
 function resolveTransactionDate(value: string, referenceDate: Date) {
   const explicit = parseExplicitDate(value);
   if (explicit) return explicit;
@@ -261,6 +270,7 @@ function resolveTransactionDate(value: string, referenceDate: Date) {
   return validDate(year, month, day);
 }
 
+// Store parsed transaction dates as local YYYY-MM-DD values.
 function isoDate(date: Date) {
   const year = date.getFullYear();
   const month = String(date.getMonth() + 1).padStart(2, "0");
@@ -268,10 +278,12 @@ function isoDate(date: Date) {
   return `${year}-${month}-${day}`;
 }
 
+// Create the month label used to group imported transactions in the UI.
 function monthKey(date: Date) {
   return `${monthNames[date.getMonth()]} ${date.getFullYear()}`;
 }
 
+// Suggest a category from merchant text and amount direction.
 function categoryFor(description: string, amount: number) {
   const value = description.toLowerCase();
   if (/payroll|salary|direct deposit|freelance|interest paid/.test(value)) return "Income";
@@ -288,10 +300,12 @@ function categoryFor(description: string, amount: number) {
   return "Other";
 }
 
+// Exclude balance and summary rows that are not individual transactions.
 function skipDescription(description: string) {
   return /^(?:TOTAL|SUBTOTAL)|OPENING BALANCE|CLOSING BALANCE|PREVIOUS (?:ACCOUNT )?BALANCE|NEW BALANCE|AVAILABLE (?:CREDIT|BALANCE)|MINIMUM PAYMENT|CREDIT LIMIT|TOTAL ACCOUNT BALANCE|TOTAL OF /i.test(description);
 }
 
+// Assign an expense or credit sign using account type and column position.
 function normalizeAmount(
   rawAmount: number,
   description: string,
@@ -310,10 +324,12 @@ function normalizeAmount(
     : -Math.abs(rawAmount);
 }
 
+// Find the horizontal centre of a PDF text fragment for column matching.
 function itemCentre(item: TextFragment) {
   return item.x + item.width / 2;
 }
 
+// Locate transaction table columns from their printed headers.
 function findHeaderHints(lines: StatementLine[]) {
   const hints: ColumnHints[] = [];
   lines.forEach((line, headerIndex) => {
@@ -322,6 +338,7 @@ function findHeaderHints(lines: StatementLine[]) {
     const hasFinancialColumn = /WITHDRAWAL|DEBIT|RETRAIT|DEPOSIT|CREDIT|DEPOT|AMOUNT|MONTANT|BALANCE|SOLDE/i.test(normalized);
     if (!hasDateOrDescription || !hasFinancialColumn) return;
 
+    // Read the printed horizontal position of each matching table heading.
     const findX = (pattern: RegExp) => {
       const item = line.items.find((fragment) => pattern.test(normalizedText(fragment.text)));
       return item ? itemCentre(item) : undefined;
@@ -343,6 +360,7 @@ function findHeaderHints(lines: StatementLine[]) {
   return hints;
 }
 
+// Classify an amount by the closest header while rejecting distant matches.
 function nearestColumn(item: TextFragment, hints: ColumnHints) {
   const x = itemCentre(item);
   const columns = (["debit", "credit", "amount", "balance"] as ColumnKind[])
@@ -358,6 +376,7 @@ function nearestColumn(item: TextFragment, hints: ColumnHints) {
   return Math.abs(nearest[1] - x) <= tolerance ? nearest[0] : undefined;
 }
 
+// Collect original currency and exchange details printed beside a transaction.
 function foreignDetails(lines: StatementLine[], index: number) {
   const nearby = [lines[index].text];
   for (let nextIndex = index + 1; nextIndex < Math.min(lines.length, index + 3); nextIndex += 1) {
@@ -386,6 +405,7 @@ function foreignDetails(lines: StatementLine[], index: number) {
   return {};
 }
 
+// Read credit card rows with one or two dates and normalize charge direction.
 function parseCreditCardLines(lines: StatementLine[], referenceDate: Date) {
   const transactions: ParsedStatementTransaction[] = [];
   lines.forEach((line, index) => {
@@ -418,6 +438,7 @@ function parseCreditCardLines(lines: StatementLine[], referenceDate: Date) {
   return transactions;
 }
 
+// Join the text fragments before the money columns into a description.
 function descriptionsFromLine(line: StatementLine, hints: ColumnHints, dateValue?: string) {
   const financialColumns = [hints.debit, hints.credit, hints.amount, hints.balance]
     .filter((value): value is number => value !== undefined);
@@ -432,12 +453,14 @@ function descriptionsFromLine(line: StatementLine, hints: ColumnHints, dateValue
   return description;
 }
 
+// Read deposit account tables, carrying dates and descriptions across wrapped rows.
 function parseDepositLines(lines: StatementLine[], referenceDate: Date, headers: ColumnHints[]) {
   const transactions: ParsedStatementTransaction[] = [];
   const headersByPage = new Map(headers.map((header) => [header.page, header]));
   const fallbackHeader = headers[0];
   let activePage = 0;
   let tableActive = false;
+  // Some banks print the date only on the first line of a wrapped transaction.
   let currentDate: Date | undefined;
   let descriptionParts: string[] = [];
 
@@ -506,6 +529,7 @@ function parseDepositLines(lines: StatementLine[], referenceDate: Date, headers:
   return transactions;
 }
 
+// Choose the month represented by the most parsed transactions.
 function mostCommonMonth(transactions: ParsedStatementTransaction[]) {
   const counts = new Map<string, number>();
   for (const transaction of transactions) {
@@ -514,6 +538,7 @@ function mostCommonMonth(transactions: ParsedStatementTransaction[]) {
   return Array.from(counts.entries()).sort((a, b) => b[1] - a[1])[0]?.[0];
 }
 
+// Coordinate detection, row parsing, confidence, and warnings for one statement.
 export function parseStatementLines(lines: StatementLine[], filename = "statement.pdf"): StatementParseResult {
   const orderedLines = [...lines].sort((a, b) => a.page - b.page || b.y - a.y);
   const text = normalizedText(orderedLines.map((line) => line.text).join("\n"));

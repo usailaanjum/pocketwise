@@ -2,6 +2,7 @@ import { desc } from "drizzle-orm";
 import { getDb } from "../../../../../db";
 import { notes } from "../../../db/schema";
 
+// Explain missing example-table migrations with a useful setup message.
 function toRouteErrorMessage(error: unknown) {
   const message = error instanceof Error ? error.message : "Unexpected error";
   const detail =
@@ -15,6 +16,7 @@ function toRouteErrorMessage(error: unknown) {
   return message;
 }
 
+// Return the most recent notes from the optional D1 example database.
 export async function GET() {
   try {
     const db = getDb();
@@ -33,6 +35,7 @@ export async function GET() {
   }
 }
 
+// Validate and create one note in the optional D1 example database.
 export async function POST(request: Request) {
   try {
     const payload = (await request.json()) as {
