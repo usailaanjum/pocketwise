@@ -52,7 +52,7 @@ Pocketwise helps an individual understand spending and anticipate future costs w
 - The category pie and list calculate spent amounts from the selected month’s transactions rather than placeholder values.
 - A user can edit any category limit and create a custom category with a name and monthly CAD limit.
 - Custom categories appear in transaction entry and filtering immediately.
-- The Settings action reopens the monthly baseline form.
+- Settings provides an editable monthly baseline, backups, original statement downloads, and a confirmed local reset.
 - Reloading the page retains local data.
 - Unsupported PDF layouts return a clear message and do not invent transactions.
 
@@ -60,9 +60,9 @@ Pocketwise helps an individual understand spending and anticipate future costs w
 
 Projected month-end spending is calculated as:
 
-`fixed or recurring spending + (flexible spending to date / elapsed days) × days in month`
+`recorded Housing and Utilities spending + (other spending to date / elapsed days) × days in month`
 
-The UI should label this as an estimate. A later version should improve the model using multiple months, pay cycles, known future bills, seasonality, and user-confirmed recurring transactions.
+The Forecast & plan area shows each term and labels the result as an estimate. Known recurring items are shown separately rather than added again, which avoids double counting a bill already present in transactions. A later version should improve the model using multiple months, pay cycles, known future bills, seasonality, and user-confirmed recurring transactions.
 
 ## Import requirements
 

@@ -106,3 +106,16 @@ export function saveImportedStatement<T>(file: File, statement: SavedStatement, 
     await complete;
   });
 }
+
+// Clear every Pocketwise store, including editable data and original files.
+export async function clearLocalDatabase(): Promise<void> {
+  return queueWrite(async () => {
+    const database = await openDatabase();
+    const transaction = database.transaction([WORKSPACE_STORE, STATEMENTS_STORE, STATEMENT_FILES_STORE], "readwrite");
+    const complete = transactionComplete(transaction);
+    transaction.objectStore(WORKSPACE_STORE).clear();
+    transaction.objectStore(STATEMENTS_STORE).clear();
+    transaction.objectStore(STATEMENT_FILES_STORE).clear();
+    await complete;
+  });
+}
